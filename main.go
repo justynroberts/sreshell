@@ -74,6 +74,12 @@ type App struct {
 	noteQueue    []string
 	noteMu       sync.Mutex
 	quit         chan struct{}
+	// Command history
+	cmdHistory    []string
+	historyIdx    int
+	historyTmp    string // stores current input when navigating history
+	// SRE suggested commands (for !N copy feature)
+	sreCommands   []string
 }
 
 func main() {
@@ -339,8 +345,34 @@ func (app *App) run() {
 func (app *App) handleShellInput(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEnter:
+		cmd := strings.TrimSpace(app.inputBuffer)
+
+		// Check for !N pattern to copy SRE command
+		if strings.HasPrefix(cmd, "!") && len(cmd) > 1 {
+			numStr := cmd[1:]
+			if num, err := parseNumber(numStr); err == nil && num >= 1 && num <= len(app.sreCommands) {
+				// Copy command from SRE suggestions
+				app.inputBuffer = app.sreCommands[num-1]
+				app.cursorPos = len(app.inputBuffer)
+				app.draw()
+				return
+			}
+		}
+
+		// Add to history if non-empty and different from last
+		if cmd != "" {
+			if len(app.cmdHistory) == 0 || app.cmdHistory[len(app.cmdHistory)-1] != cmd {
+				app.cmdHistory = append(app.cmdHistory, cmd)
+				// Keep history manageable
+				if len(app.cmdHistory) > 500 {
+					app.cmdHistory = app.cmdHistory[len(app.cmdHistory)-250:]
+				}
+			}
+		}
+		app.historyIdx = len(app.cmdHistory)
+		app.historyTmp = ""
+
 		// Log command before sending
-		cmd := app.inputBuffer
 		if cmd != "" {
 			app.cmdBuffer.WriteString(cmd + "\n")
 		}
@@ -379,9 +411,31 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 		if app.cursorPos < len(app.inputBuffer) {
 			app.cursorPos++
 		}
-	case tcell.KeyUp, tcell.KeyDown:
-		// Pass arrow keys to shell for history
-		app.shellPty.Write([]byte{0x1b, '[', byte('A' + ev.Key() - tcell.KeyUp)})
+	case tcell.KeyUp:
+		// Navigate command history (up = older)
+		if len(app.cmdHistory) > 0 {
+			if app.historyIdx == len(app.cmdHistory) {
+				// Save current input before navigating
+				app.historyTmp = app.inputBuffer
+			}
+			if app.historyIdx > 0 {
+				app.historyIdx--
+				app.inputBuffer = app.cmdHistory[app.historyIdx]
+				app.cursorPos = len(app.inputBuffer)
+			}
+		}
+	case tcell.KeyDown:
+		// Navigate command history (down = newer)
+		if app.historyIdx < len(app.cmdHistory) {
+			app.historyIdx++
+			if app.historyIdx == len(app.cmdHistory) {
+				// Restore saved input
+				app.inputBuffer = app.historyTmp
+			} else {
+				app.inputBuffer = app.cmdHistory[app.historyIdx]
+			}
+			app.cursorPos = len(app.inputBuffer)
+		}
 	case tcell.KeyCtrlC:
 		app.shellPty.Write([]byte{0x03})
 	case tcell.KeyCtrlD:
@@ -390,6 +444,9 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 		app.shellPty.Write([]byte{0x1a})
 	case tcell.KeyCtrlL:
 		app.shellPty.Write([]byte{0x0c})
+	case tcell.KeyCtrlR:
+		// Reverse search - show history hint
+		app.addSREOutput("History search: use Up/Down arrows or !N to copy SRE command")
 	default:
 		if ev.Rune() != 0 {
 			app.inputBuffer = app.inputBuffer[:app.cursorPos] + string(ev.Rune()) + app.inputBuffer[app.cursorPos:]
@@ -559,7 +616,10 @@ func (app *App) draw() {
 	app.screen.ShowCursor(len(prompt)+app.cursorPos, inputY)
 
 	// Help text
-	helpText := "[Tab: switch pane] [Alt+Ctrl+C: quit]"
+	helpText := "[Tab: pane] [Up/Down: history] [!N: copy cmd] [Alt+Ctrl+C: quit]"
+	if len(helpText) > w-len(prompt)-len(app.inputBuffer)-2 {
+		helpText = "[Tab] [!N] [Alt+Ctrl+C]"
+	}
 	app.drawString(w-len(helpText)-1, inputY, helpText, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
 
 	app.screen.Show()
@@ -605,9 +665,6 @@ func (app *App) querySREAgent(query string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// For now, simulate SRE agent response based on incident context
-	// The actual SRE Agent API may require different endpoints
-	// This provides useful context while we integrate the full API
 	var pastIncidents struct {
 		PastIncidents []struct {
 			Incident struct {
@@ -622,8 +679,10 @@ func (app *App) querySREAgent(query string) (string, error) {
 		json.NewDecoder(resp.Body).Decode(&pastIncidents)
 	}
 
-	// Build context-aware response
+	// Build context-aware response with numbered commands
 	var response strings.Builder
+	var commands []string
+
 	response.WriteString(fmt.Sprintf("Incident: %s\n\n", app.incident.Title))
 
 	if len(pastIncidents.PastIncidents) > 0 {
@@ -632,40 +691,75 @@ func (app *App) querySREAgent(query string) (string, error) {
 			if i >= 3 {
 				break
 			}
-			response.WriteString(fmt.Sprintf("- %s (similarity: %d%%)\n", pi.Incident.Title, pi.Score))
+			response.WriteString(fmt.Sprintf("- %s (%d%% similar)\n", pi.Incident.Title, pi.Score))
 		}
 		response.WriteString("\n")
 	}
 
-	// Add query-specific guidance
+	// Add query-specific guidance with numbered commands
 	queryLower := strings.ToLower(query)
 	if strings.Contains(queryLower, "log") {
 		response.WriteString("Suggested commands:\n")
-		response.WriteString("- kubectl logs <pod> --tail=100\n")
-		response.WriteString("- journalctl -u <service> -n 50\n")
-		response.WriteString("- tail -f /var/log/syslog\n")
+		commands = append(commands, "kubectl logs -l app=<name> --tail=100")
+		commands = append(commands, "journalctl -u <service> -n 50 --no-pager")
+		commands = append(commands, "tail -f /var/log/syslog")
+		commands = append(commands, "docker logs --tail 100 <container>")
 	} else if strings.Contains(queryLower, "network") || strings.Contains(queryLower, "connect") {
 		response.WriteString("Network troubleshooting:\n")
-		response.WriteString("- curl -v <endpoint>\n")
-		response.WriteString("- nc -zv <host> <port>\n")
-		response.WriteString("- dig <domain>\n")
+		commands = append(commands, "curl -sv --connect-timeout 5 <endpoint>")
+		commands = append(commands, "nc -zv <host> <port>")
+		commands = append(commands, "dig +short <domain>")
+		commands = append(commands, "traceroute <host>")
 	} else if strings.Contains(queryLower, "memory") || strings.Contains(queryLower, "cpu") || strings.Contains(queryLower, "resource") {
 		response.WriteString("Resource checks:\n")
-		response.WriteString("- top -bn1 | head -20\n")
-		response.WriteString("- free -h\n")
-		response.WriteString("- kubectl top pods\n")
+		commands = append(commands, "top -bn1 | head -20")
+		commands = append(commands, "free -h")
+		commands = append(commands, "kubectl top pods")
+		commands = append(commands, "df -h")
 	} else if strings.Contains(queryLower, "restart") || strings.Contains(queryLower, "recover") {
 		response.WriteString("Recovery options:\n")
-		response.WriteString("- kubectl rollout restart deployment/<name>\n")
-		response.WriteString("- systemctl restart <service>\n")
-		response.WriteString("- docker restart <container>\n")
+		commands = append(commands, "kubectl rollout restart deployment/<name>")
+		commands = append(commands, "systemctl restart <service>")
+		commands = append(commands, "docker restart <container>")
+		commands = append(commands, "kubectl delete pod <pod-name>")
+	} else if strings.Contains(queryLower, "pod") || strings.Contains(queryLower, "kubernetes") || strings.Contains(queryLower, "k8s") {
+		response.WriteString("Kubernetes diagnostics:\n")
+		commands = append(commands, "kubectl get pods -o wide")
+		commands = append(commands, "kubectl describe pod <pod-name>")
+		commands = append(commands, "kubectl get events --sort-by='.lastTimestamp'")
+		commands = append(commands, "kubectl logs <pod-name> --previous")
+	} else if strings.Contains(queryLower, "disk") || strings.Contains(queryLower, "storage") {
+		response.WriteString("Storage diagnostics:\n")
+		commands = append(commands, "df -h")
+		commands = append(commands, "du -sh /*")
+		commands = append(commands, "lsblk")
+		commands = append(commands, "iostat -x 1 5")
+	} else if strings.Contains(queryLower, "process") || strings.Contains(queryLower, "pid") {
+		response.WriteString("Process diagnostics:\n")
+		commands = append(commands, "ps aux --sort=-%mem | head -20")
+		commands = append(commands, "pgrep -af <pattern>")
+		commands = append(commands, "lsof -i :<port>")
+		commands = append(commands, "strace -p <pid> -f")
 	} else {
-		response.WriteString("Available queries:\n")
-		response.WriteString("- 'check logs' - log inspection commands\n")
-		response.WriteString("- 'network issues' - connectivity tests\n")
-		response.WriteString("- 'resource usage' - memory/CPU checks\n")
-		response.WriteString("- 'how to restart' - recovery procedures\n")
+		response.WriteString("Quick commands (type !N to use):\n")
+		commands = append(commands, "kubectl get pods")
+		commands = append(commands, "docker ps")
+		commands = append(commands, "systemctl status")
+		response.WriteString("\nAsk about: logs, network, resources,\n")
+		response.WriteString("kubernetes, disk, processes, restart\n")
 	}
+
+	// Write numbered commands
+	for i, cmd := range commands {
+		response.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, cmd))
+	}
+
+	// Store commands for !N feature
+	app.mu.Lock()
+	app.sreCommands = commands
+	app.mu.Unlock()
+
+	response.WriteString("\nType !N in shell to copy command N")
 
 	return response.String(), nil
 }
@@ -775,4 +869,15 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+func parseNumber(s string) (int, error) {
+	var n int
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("not a number")
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, nil
 }
