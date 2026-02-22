@@ -62,6 +62,7 @@ Select an incident and start troubleshooting.
 ## Features
 
 - **Split-pane TUI**: Shell on left (60%), SRE agent on right (40%)
+- **Tmux Integration**: Uses tmux for full shell experience (prompt, aliases, colors)
 - **PagerDuty Integration**: Select from open incidents, auto-sync notes
 - **SRE Triage**: Automatic root cause analysis and numbered next steps
 - **Command History**: Left/Right arrows navigate history
@@ -72,6 +73,7 @@ Select an incident and start troubleshooting.
 - Go 1.21+ (for building from source)
 - PagerDuty account with API access
 - PagerDuty Advance license (for SRE AI features)
+- tmux (optional but recommended - falls back to basic shell if not available)
 
 ## Dependencies
 
@@ -233,6 +235,11 @@ alias sre="sreshell"
 ### Notes not syncing
 - Ensure PAGERDUTY_EMAIL is set if using service account token
 - Notes sync every 30 seconds or when asking SRE questions
+
+### Tmux not working
+- Install tmux: `brew install tmux` (macOS) or `apt install tmux` (Linux)
+- SREShell falls back to basic shell if tmux is not installed
+- Your prompt, aliases, and shell settings require tmux
 
 ## Source Code
 

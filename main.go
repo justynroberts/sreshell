@@ -91,6 +91,8 @@ type App struct {
 	// Status message (shown briefly below input)
 	statusMsg     string
 	statusMsgTime time.Time
+	// Tmux session name for shell
+	tmuxSession string
 }
 
 func main() {
@@ -354,6 +356,11 @@ func (app *App) runIncidentSession() {
 		app.shellCmd.Process.Kill()
 		app.shellCmd.Wait() // Prevent zombie process
 	}
+	// Kill tmux session if we created one
+	if app.tmuxSession != "" {
+		exec.Command("tmux", "kill-session", "-t", app.tmuxSession).Run()
+		app.tmuxSession = ""
+	}
 	screen.Fini()
 
 	// Clear buffers
@@ -527,18 +534,37 @@ func (app *App) selectIncident() (*Incident, error) {
 }
 
 func (app *App) startShell() error {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
+	// Check if tmux is available
+	tmuxPath, err := exec.LookPath("tmux")
+	useTmux := err == nil
+
+	if useTmux {
+		// Create unique tmux session name for this incident
+		app.tmuxSession = fmt.Sprintf("sreshell-%d", app.incident.IncidentNum)
+
+		// Kill any existing session with this name (cleanup from crashes)
+		exec.Command(tmuxPath, "kill-session", "-t", app.tmuxSession).Run()
+
+		// Start tmux with a new session
+		// -2 forces 256 colors, uses user's default shell
+		app.shellCmd = exec.Command(tmuxPath, "new-session", "-A", "-s", app.tmuxSession)
+		app.shellCmd.Env = append(os.Environ(),
+			fmt.Sprintf("PAGERDUTY_INCIDENT=%s", app.incident.ID),
+			fmt.Sprintf("PAGERDUTY_INCIDENT_NUM=%d", app.incident.IncidentNum),
+		)
+	} else {
+		// Fall back to direct shell if tmux not available
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+		app.shellCmd = exec.Command(shell)
+		app.shellCmd.Env = append(os.Environ(),
+			fmt.Sprintf("PAGERDUTY_INCIDENT=%s", app.incident.ID),
+			fmt.Sprintf("PAGERDUTY_INCIDENT_NUM=%d", app.incident.IncidentNum),
+		)
 	}
 
-	app.shellCmd = exec.Command(shell)
-	app.shellCmd.Env = append(os.Environ(),
-		fmt.Sprintf("PAGERDUTY_INCIDENT=%s", app.incident.ID),
-		fmt.Sprintf("PAGERDUTY_INCIDENT_NUM=%d", app.incident.IncidentNum),
-	)
-
-	var err error
 	app.shellPty, err = pty.Start(app.shellCmd)
 	if err != nil {
 		return err
