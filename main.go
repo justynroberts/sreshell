@@ -861,11 +861,26 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 			app.outputBuffer.Reset()
 			app.mu.Unlock()
 
+			// Only save note if there was an actual command
 			if command != "" {
-				note := fmt.Sprintf("$ %s\n%s", command, output)
-				app.queueNote(note)
+				// Strip trailing prompt lines from output
+				output = stripTrailingPrompt(output)
+				if output != "" || command != "" {
+					note := fmt.Sprintf("$ %s\n%s", command, strings.TrimSpace(output))
+					app.queueNote(note)
+				}
 			}
 		}(cmd)
+
+		// If empty enter, just clear buffer (don't let prompt accumulate)
+		if cmd == "" {
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				app.mu.Lock()
+				app.outputBuffer.Reset()
+				app.mu.Unlock()
+			}()
+		}
 
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if app.cursorPos > 0 {
@@ -1829,6 +1844,31 @@ func (app *App) setStatus(msg string) {
 }
 
 // Helper functions
+
+func stripTrailingPrompt(s string) string {
+	lines := strings.Split(s, "\n")
+	// Remove trailing lines that look like shell prompts
+	for len(lines) > 0 {
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if last == "" {
+			lines = lines[:len(lines)-1]
+			continue
+		}
+		// Common prompt endings
+		if strings.HasSuffix(last, "❯") ||
+			strings.HasSuffix(last, "$") ||
+			strings.HasSuffix(last, "#") ||
+			strings.HasSuffix(last, "%") ||
+			strings.HasSuffix(last, ">") ||
+			strings.Contains(last, "➜") ||
+			strings.Contains(last, "╱") {
+			lines = lines[:len(lines)-1]
+			continue
+		}
+		break
+	}
+	return strings.Join(lines, "\n")
+}
 
 func stripMarkdown(s string) string {
 	// Remove bold **text** and __text__
