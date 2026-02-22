@@ -147,10 +147,10 @@ func main() {
 	app.queueNote(fmt.Sprintf("=== Troubleshooting session started ===\nIncident: %s\nTime: %s",
 		app.incident.Title, time.Now().Format(time.RFC3339)))
 
-	// Initial SRE agent query
+	// Initial SRE agent query - get incident details
 	go func() {
-		app.addSREOutput("Analyzing incident...")
-		resp, err := app.querySREAgent("Provide a brief summary of this incident and suggest initial troubleshooting steps.")
+		app.addSREOutput("Fetching incident details...")
+		resp, err := app.querySREAgent(fmt.Sprintf("Get incident details for incident %s", app.incident.ID))
 		if err != nil {
 			app.addSREOutput(fmt.Sprintf("Error: %v", err))
 		} else {
@@ -704,14 +704,11 @@ type MCPResponse struct {
 }
 
 func (app *App) querySREAgent(query string) (string, error) {
-	// Try PagerDuty Advance MCP endpoint first
 	mcpResponse, err := app.callAdvanceMCP(query)
-	if err == nil && mcpResponse != "" {
-		return app.formatMCPResponse(mcpResponse, query), nil
+	if err != nil {
+		return "", err
 	}
-
-	// Fallback to local suggestions if MCP fails
-	return app.localSREFallback(query, err), nil
+	return app.formatMCPResponse(mcpResponse, query), nil
 }
 
 func (app *App) callAdvanceMCP(query string) (string, error) {
@@ -819,85 +816,6 @@ func (app *App) formatMCPResponse(response string, query string) string {
 	app.mu.Unlock()
 
 	return result.String()
-}
-
-func (app *App) localSREFallback(query string, mcpErr error) string {
-	var response strings.Builder
-	var commands []string
-
-	if mcpErr != nil {
-		response.WriteString(fmt.Sprintf("[MCP unavailable: %v]\n", mcpErr))
-		response.WriteString("Using local suggestions:\n\n")
-	}
-
-	response.WriteString(fmt.Sprintf("Incident: %s\n\n", app.incident.Title))
-
-	// Add query-specific guidance with numbered commands
-	queryLower := strings.ToLower(query)
-	if strings.Contains(queryLower, "log") {
-		response.WriteString("Suggested commands:\n")
-		commands = append(commands, "kubectl logs -l app=<name> --tail=100")
-		commands = append(commands, "journalctl -u <service> -n 50 --no-pager")
-		commands = append(commands, "tail -f /var/log/syslog")
-		commands = append(commands, "docker logs --tail 100 <container>")
-	} else if strings.Contains(queryLower, "network") || strings.Contains(queryLower, "connect") {
-		response.WriteString("Network troubleshooting:\n")
-		commands = append(commands, "curl -sv --connect-timeout 5 <endpoint>")
-		commands = append(commands, "nc -zv <host> <port>")
-		commands = append(commands, "dig +short <domain>")
-		commands = append(commands, "traceroute <host>")
-	} else if strings.Contains(queryLower, "memory") || strings.Contains(queryLower, "cpu") || strings.Contains(queryLower, "resource") {
-		response.WriteString("Resource checks:\n")
-		commands = append(commands, "top -bn1 | head -20")
-		commands = append(commands, "free -h")
-		commands = append(commands, "kubectl top pods")
-		commands = append(commands, "df -h")
-	} else if strings.Contains(queryLower, "restart") || strings.Contains(queryLower, "recover") {
-		response.WriteString("Recovery options:\n")
-		commands = append(commands, "kubectl rollout restart deployment/<name>")
-		commands = append(commands, "systemctl restart <service>")
-		commands = append(commands, "docker restart <container>")
-		commands = append(commands, "kubectl delete pod <pod-name>")
-	} else if strings.Contains(queryLower, "pod") || strings.Contains(queryLower, "kubernetes") || strings.Contains(queryLower, "k8s") {
-		response.WriteString("Kubernetes diagnostics:\n")
-		commands = append(commands, "kubectl get pods -o wide")
-		commands = append(commands, "kubectl describe pod <pod-name>")
-		commands = append(commands, "kubectl get events --sort-by='.lastTimestamp'")
-		commands = append(commands, "kubectl logs <pod-name> --previous")
-	} else if strings.Contains(queryLower, "disk") || strings.Contains(queryLower, "storage") {
-		response.WriteString("Storage diagnostics:\n")
-		commands = append(commands, "df -h")
-		commands = append(commands, "du -sh /*")
-		commands = append(commands, "lsblk")
-		commands = append(commands, "iostat -x 1 5")
-	} else if strings.Contains(queryLower, "process") || strings.Contains(queryLower, "pid") {
-		response.WriteString("Process diagnostics:\n")
-		commands = append(commands, "ps aux --sort=-%mem | head -20")
-		commands = append(commands, "pgrep -af <pattern>")
-		commands = append(commands, "lsof -i :<port>")
-		commands = append(commands, "strace -p <pid> -f")
-	} else {
-		response.WriteString("Quick commands (type !N to use):\n")
-		commands = append(commands, "kubectl get pods")
-		commands = append(commands, "docker ps")
-		commands = append(commands, "systemctl status")
-		response.WriteString("\nAsk about: logs, network, resources,\n")
-		response.WriteString("kubernetes, disk, processes, restart\n")
-	}
-
-	// Write numbered commands
-	for i, cmd := range commands {
-		response.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, cmd))
-	}
-
-	// Store commands for !N feature
-	app.mu.Lock()
-	app.sreCommands = commands
-	app.mu.Unlock()
-
-	response.WriteString("\nType !N in shell to copy command N")
-
-	return response.String()
 }
 
 func (app *App) queueNote(content string) {
