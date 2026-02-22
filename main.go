@@ -781,6 +781,11 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// SRE agent requires user identification
+	fromEmail := os.Getenv("PAGERDUTY_EMAIL")
+	if fromEmail != "" {
+		req.Header.Set("From", fromEmail)
+	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
