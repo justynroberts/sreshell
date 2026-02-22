@@ -1773,51 +1773,51 @@ func (app *App) flushNotes() {
 		return
 	}
 
-	// Combine all queued notes
-	combined := strings.Join(app.noteQueue, "\n---\n")
-	count := len(app.noteQueue)
+	// Copy queue and clear
+	notes := make([]string, len(app.noteQueue))
+	copy(notes, app.noteQueue)
+	count := len(notes)
 	app.noteQueue = nil
 	app.noteMu.Unlock()
 
-	// Truncate if too long
-	if len(combined) > 25000 {
-		combined = combined[:25000] + "\n[truncated]"
-	}
-
-	// Post to PagerDuty
-	noteReq := NoteRequest{}
-	noteReq.Note.Content = combined
-
-	body, _ := json.Marshal(noteReq)
-	url := fmt.Sprintf("%s/incidents/%s/notes", app.baseURL, app.incident.ID)
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		app.addSREOutput(fmt.Sprintf("[Note error: %v]", err))
-		return
-	}
-	req.Header.Set("Authorization", "Token token="+app.apiToken)
-	req.Header.Set("Content-Type", "application/json")
-	// From header required - use PAGERDUTY_EMAIL env var or default
+	// Post each note separately (one note = one command + response)
 	fromEmail := os.Getenv("PAGERDUTY_EMAIL")
 	if fromEmail == "" {
-		fromEmail = "tshell@local"
+		fromEmail = "sreshell@local"
 	}
-	req.Header.Set("From", fromEmail)
+	url := fmt.Sprintf("%s/incidents/%s/notes", app.baseURL, app.incident.ID)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		app.addSREOutput(fmt.Sprintf("[Note error: %v]", err))
-		return
-	}
-	defer resp.Body.Close()
+	for _, note := range notes {
+		// Truncate if too long
+		if len(note) > 25000 {
+			note = note[:25000] + "\n[truncated]"
+		}
 
-	if resp.StatusCode != 201 {
-		respBody, _ := io.ReadAll(resp.Body)
-		app.setStatus(fmt.Sprintf("Note failed: %s", string(respBody)))
-	} else {
-		app.setStatus(fmt.Sprintf("Saved %d notes (!r to refresh)", count))
+		noteReq := NoteRequest{}
+		noteReq.Note.Content = note
+
+		body, _ := json.Marshal(noteReq)
+		req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Token token="+app.apiToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("From", fromEmail)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != 201 {
+			// Note failed, but continue with others
+			continue
+		}
 	}
+
+	app.setStatus(fmt.Sprintf("Saved %d notes (!r to refresh)", count))
 }
 
 func (app *App) setStatus(msg string) {
