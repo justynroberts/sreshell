@@ -749,22 +749,22 @@ func (app *App) querySREAgent(query string) (string, error) {
 	return app.formatMCPResponse(mcpResponse, query), nil
 }
 
-func (app *App) callAdvanceMCP(query string) (string, error) {
-	// PagerDuty Advance MCP endpoint
-	mcpURL := "https://mcp.pagerduty.com/mcp"
+func (app *App) callAdvanceMCP(message string) (string, error) {
+	// PagerDuty Advance MCP endpoint (different from main MCP)
+	mcpURL := "https://mcp.pagerduty.com/pagerduty-advance-mcp"
 
 	// Build MCP tool call request
 	toolCall := MCPToolCall{
 		Name: "sre_agent_tool",
 		Arguments: map[string]interface{}{
 			"incident_id": app.incident.ID,
-			"query":       query,
+			"message":     message,
 		},
 	}
 
 	mcpReq := MCPRequest{
 		JSONRPC: "2.0",
-		ID:      1,
+		ID:      int(time.Now().UnixMilli()),
 		Method:  "tools/call",
 		Params:  toolCall,
 	}
@@ -780,7 +780,7 @@ func (app *App) callAdvanceMCP(query string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
