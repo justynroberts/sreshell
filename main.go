@@ -147,10 +147,10 @@ func main() {
 	app.queueNote(fmt.Sprintf("=== Troubleshooting session started ===\nIncident: %s\nTime: %s",
 		app.incident.Title, time.Now().Format(time.RFC3339)))
 
-	// Initial SRE agent query - get incident details
+	// Initial SRE agent query - run analysis
 	go func() {
-		app.addSREOutput("Fetching incident details...")
-		resp, err := app.querySREAgent(fmt.Sprintf("Get incident details for incident %s", app.incident.ID))
+		app.addSREOutput("Running incident analysis...")
+		resp, err := app.querySREAgent(fmt.Sprintf("run analysis for incident %s", app.incident.ID))
 		if err != nil {
 			app.addSREOutput(fmt.Sprintf("Error: %v", err))
 		} else {
@@ -488,6 +488,18 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEnter:
 		query := strings.TrimSpace(app.inputBuffer)
+
+		// Check for quit commands
+		if query == "!q" || query == "!quit" || query == "!exit" {
+			close(app.quit)
+			return
+		}
+
+		// Check for shortcut commands
+		if query == "!next" || query == "!n" {
+			query = fmt.Sprintf("what are my next steps for incident %s", app.incident.ID)
+		}
+
 		if query != "" {
 			app.addSREOutput(fmt.Sprintf("> %s", query))
 			app.addSREOutput("Thinking...")
@@ -512,6 +524,25 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 				app.draw()
 			}(query)
 		}
+	case tcell.KeyCtrlN:
+		// Shortcut for "what are my next steps"
+		app.addSREOutput("> what are my next steps?")
+		app.addSREOutput("Thinking...")
+		app.draw()
+		go func() {
+			resp, err := app.querySREAgent(fmt.Sprintf("what are my next steps for incident %s", app.incident.ID))
+			app.mu.Lock()
+			if len(app.sreOutput) > 0 {
+				app.sreOutput = app.sreOutput[:len(app.sreOutput)-1]
+			}
+			app.mu.Unlock()
+			if err != nil {
+				app.addSREOutput(fmt.Sprintf("Error: %v", err))
+			} else {
+				app.addSREOutput(resp)
+			}
+			app.draw()
+		}()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if app.cursorPos > 0 {
 			app.inputBuffer = app.inputBuffer[:app.cursorPos-1] + app.inputBuffer[app.cursorPos:]
@@ -644,9 +675,14 @@ func (app *App) draw() {
 	app.screen.ShowCursor(len(prompt)+app.cursorPos, inputY)
 
 	// Help text
-	helpText := "[Tab: pane] [Up/Down: history] [!N: copy] [!q: quit]"
+	var helpText string
+	if app.inputMode == "shell" {
+		helpText = "[Tab: pane] [Up/Down: history] [!N: copy] [!q: quit]"
+	} else {
+		helpText = "[Tab: pane] [Ctrl+N: next steps] [!n: next] [!q: quit]"
+	}
 	if len(helpText) > w-len(prompt)-len(app.inputBuffer)-2 {
-		helpText = "[Tab] [!N] [!q]"
+		helpText = "[Tab] [!q]"
 	}
 	app.drawString(w-len(helpText)-1, inputY, helpText, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
 
