@@ -941,14 +941,29 @@ func stripANSI(s string) string {
 	var result strings.Builder
 	inEscape := false
 	inCSI := false
+	inOSC := false
 	for _, r := range s {
+		// Start of escape sequence
 		if r == '\x1b' {
 			inEscape = true
 			continue
 		}
+		// Handle escape sequences
 		if inEscape {
 			if r == '[' {
 				inCSI = true
+				continue
+			}
+			if r == ']' {
+				inOSC = true // Operating System Command (title, etc)
+				continue
+			}
+			if inOSC {
+				// OSC ends with BEL (\x07) or ST (\x1b\\)
+				if r == '\x07' {
+					inEscape = false
+					inOSC = false
+				}
 				continue
 			}
 			if inCSI {
@@ -959,10 +974,14 @@ func stripANSI(s string) string {
 				}
 				continue
 			}
-			// Non-CSI escape sequence
+			// Non-CSI escape sequence ends with letter
 			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 				inEscape = false
 			}
+			continue
+		}
+		// Skip other control characters
+		if r < 32 && r != '\n' && r != '\t' {
 			continue
 		}
 		result.WriteRune(r)
