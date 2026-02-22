@@ -861,7 +861,7 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 			app.outputBuffer.Reset()
 			app.mu.Unlock()
 
-			if command != "" || output != "" {
+			if command != "" {
 				note := fmt.Sprintf("$ %s\n%s", command, output)
 				app.queueNote(note)
 			}
