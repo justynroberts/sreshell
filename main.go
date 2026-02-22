@@ -28,6 +28,7 @@ type Incident struct {
 	Urgency     string `json:"urgency"`
 	CreatedAt   string `json:"created_at"`
 	Service     struct {
+		ID      string `json:"id"`
 		Summary string `json:"summary"`
 	} `json:"service"`
 }
@@ -60,12 +61,13 @@ type App struct {
 	userID       string
 	userEmail    string
 	incident     *Incident
+	sessionID    string // SRE agent session - persists per incident
 	shellCmd     *exec.Cmd
 	shellPty     *os.File
 	shellOutput  []string
 	sreOutput    []string
-	shellScroll  int
-	sreScroll    int
+	shellScroll  int // lines scrolled up from bottom
+	sreScroll    int // lines scrolled up from bottom
 	inputBuffer  string
 	inputMode    string // "shell" or "sre"
 	cursorPos    int
@@ -78,17 +80,27 @@ type App struct {
 	noteMu       sync.Mutex
 	quit         chan struct{}
 	// Command history
-	cmdHistory    []string
-	historyIdx    int
-	historyTmp    string // stores current input when navigating history
-	// SRE suggested commands (for !N copy feature)
-	sreCommands   []string
+	cmdHistory []string
+	historyIdx int
+	historyTmp string // stores current input when navigating history
+	// Cached data for on-demand display
+	pastIncidentsCache string
+	fullAnalysisCache  string
+	// Help popup
+	showHelp bool
+	// Status message (shown briefly below input)
+	statusMsg     string
+	statusMsgTime time.Time
 }
 
 func main() {
-	token := strings.TrimSpace(os.Getenv("PAGERDUTY_TOKEN"))
+	// Prefer PAGERDUTY_USER_TOKEN (user token), fall back to PAGERDUTY_TOKEN
+	token := strings.TrimSpace(os.Getenv("PAGERDUTY_USER_TOKEN"))
 	if token == "" {
-		fmt.Println("Error: PAGERDUTY_TOKEN environment variable required")
+		token = strings.TrimSpace(os.Getenv("PAGERDUTY_TOKEN"))
+	}
+	if token == "" {
+		fmt.Println("Error: PAGERDUTY_USER_TOKEN or PAGERDUTY_TOKEN environment variable required")
 		os.Exit(1)
 	}
 	// Strip quotes and common mistakes
@@ -106,7 +118,6 @@ func main() {
 		apiToken:  token,
 		baseURL:   baseURL,
 		inputMode: "shell",
-		quit:      make(chan struct{}),
 	}
 
 	// Fetch current user ID for SRE agent
@@ -114,24 +125,53 @@ func main() {
 		fmt.Printf("Warning: Could not fetch user: %v\n", err)
 	}
 
-	// Fetch and select incident
-	incident, err := app.selectIncident()
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
-	app.incident = incident
+	// Main loop - select incident and run session
+	for {
+		// Reset state for new session
+		app.quit = make(chan struct{})
+		app.shellOutput = nil
+		app.sreOutput = nil
+		app.shellScroll = 0
+		app.sreScroll = 0
+		app.inputBuffer = ""
+		app.cursorPos = 0
+		app.inputMode = "shell"
+		app.pastIncidentsCache = ""
+		app.fullAnalysisCache = ""
+		app.showHelp = false
 
+		// Fetch and select incident
+		incident, err := app.selectIncident()
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		if incident == nil {
+			// User quit
+			fmt.Println("Goodbye!")
+			os.Exit(0)
+		}
+		app.incident = incident
+		app.sessionID = fmt.Sprintf("%s-%s", app.userID, incident.ID)
+
+		// Run session for this incident
+		app.runIncidentSession()
+	}
+}
+
+func (app *App) runIncidentSession() {
 	// Initialize screen
 	screen, err := tcell.NewScreen()
 	if err != nil {
 		fmt.Printf("Error creating screen: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	if err := screen.Init(); err != nil {
 		fmt.Printf("Error initializing screen: %v\n", err)
-		os.Exit(1)
+		return
 	}
+	// Mouse disabled to allow normal terminal text selection/copy
+	// Use PgUp/PgDn or arrow keys to scroll
 	app.screen = screen
 	app.width, app.height = screen.Size()
 
@@ -139,7 +179,7 @@ func main() {
 	if err := app.startShell(); err != nil {
 		screen.Fini()
 		fmt.Printf("Error starting shell: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
 	// Handle signals
@@ -154,13 +194,150 @@ func main() {
 	app.queueNote(fmt.Sprintf("=== Troubleshooting session started ===\nIncident: %s\nTime: %s",
 		app.incident.Title, time.Now().Format(time.RFC3339)))
 
-	// Initial SRE agent query - run analysis
+	// Initial SRE agent query - gather context first, then run analysis
 	go func() {
-		app.addSREOutput("Running incident analysis...")
-		resp, err := app.querySREAgent(fmt.Sprintf("run analysis for incident %s", app.incident.ID))
+		// Clear debug file
+		os.WriteFile("sre_output.txt", []byte{}, 0644)
+
+		// Header with full title
+		app.addSREOutput(fmt.Sprintf("#%d | %s | %s", app.incident.IncidentNum, app.incident.Status, app.incident.Service.Summary))
+		app.addSREOutput(app.incident.Title)
+		app.addSREOutput("")
+		app.draw()
+
+		// Get recent changes
+		app.addSREOutput("RECENT CHANGES:")
+		app.draw()
+		recentChanges, _ := app.callStandardMCP("list_change_events", map[string]interface{}{
+			"query_model": map[string]interface{}{
+				"limit": 3,
+			},
+		})
+		if recentChanges != "" {
+			formatted := formatChanges(recentChanges)
+			if formatted != "" {
+				app.addSREOutput(formatted)
+			} else {
+				app.addSREOutput("  (none)")
+			}
+		} else {
+			app.addSREOutput("  (none)")
+		}
+		app.draw()
+
+		// Get incident details (for context, not display)
+		details, _ := app.callStandardMCP("get_incident", map[string]interface{}{
+			"incident_id": app.incident.ID,
+		})
+
+		// Get related/past incidents from same service
+		app.addSREOutput("")
+		app.addSREOutput("RELATED INCIDENTS:")
+		app.draw()
+		pastIncidents, _ := app.callStandardMCP("list_incidents", map[string]interface{}{
+			"query_model": map[string]interface{}{
+				"status":      "resolved",
+				"service_ids": []string{app.incident.Service.ID},
+				"limit":       3,
+			},
+		})
+		if pastIncidents != "" {
+			formatted := formatIncidentsCompact(pastIncidents)
+			if formatted != "" {
+				app.addSREOutput(formatted)
+			} else {
+				app.addSREOutput("  (none)")
+			}
+		} else {
+			app.addSREOutput("  (none)")
+		}
+		// Store for !h command
+		app.mu.Lock()
+		app.pastIncidentsCache = pastIncidents
+		app.mu.Unlock()
+
+		app.addSREOutput("")
+		app.draw()
+
+		// Build triage request for SRE agent
+		var context strings.Builder
+		context.WriteString(fmt.Sprintf("Triage incident %s.\n\n", app.incident.ID))
+		if details != "" {
+			context.WriteString("Incident Details:\n")
+			context.WriteString(details)
+			context.WriteString("\n\n")
+		}
+		if recentChanges != "" {
+			context.WriteString("Recent Changes:\n")
+			context.WriteString(recentChanges)
+			context.WriteString("\n\n")
+		}
+		context.WriteString("Provide:\n")
+		context.WriteString("1. POTENTIAL ROOT CAUSE: One paragraph on the likely cause\n")
+		context.WriteString("2. NEXT STEPS: Numbered list of 3-5 diagnostic/remediation steps\n")
+		context.WriteString("Be concise and actionable.")
+
+		app.addSREOutput("")
+		app.addSREOutput("Running SRE analysis...")
+		app.draw()
+
+		// Show progress while waiting for SRE response
+		done := make(chan bool)
+		go func() {
+			dots := 0
+			for {
+				select {
+				case <-done:
+					return
+				case <-time.After(1 * time.Second):
+					dots++
+					app.mu.Lock()
+					if len(app.sreOutput) > 0 {
+						// Update the last line with progress
+						app.sreOutput[len(app.sreOutput)-1] = fmt.Sprintf("Running SRE analysis%s (%ds)", strings.Repeat(".", dots%4), dots)
+					}
+					app.mu.Unlock()
+					app.draw()
+				}
+			}
+		}()
+
+		// Try up to 3 times for transient errors
+		var resp string
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			resp, err = app.querySREAgent(context.String())
+			if err == nil {
+				break
+			}
+			if strings.Contains(err.Error(), "Server error") && attempt < 3 {
+				app.mu.Lock()
+				if len(app.sreOutput) > 0 {
+					app.sreOutput[len(app.sreOutput)-1] = fmt.Sprintf("Retrying... (attempt %d/3)", attempt+1)
+				}
+				app.mu.Unlock()
+				app.draw()
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			break
+		}
+		close(done)
+
+		// Clear the progress line
+		app.mu.Lock()
+		if len(app.sreOutput) > 0 {
+			app.sreOutput = app.sreOutput[:len(app.sreOutput)-1]
+		}
+		app.mu.Unlock()
+
 		if err != nil {
 			app.addSREOutput(fmt.Sprintf("Error: %v", err))
+		} else if resp == "" {
+			app.addSREOutput("(SRE agent returned empty response)")
 		} else {
+			app.addSREOutput("---")
+			app.addSREOutput("TRIAGE:")
 			app.addSREOutput(resp)
 		}
 		app.draw()
@@ -170,16 +347,27 @@ func main() {
 	app.run()
 
 	// Cleanup
-	app.shellPty.Close()
-	app.shellCmd.Process.Kill()
+	if app.shellPty != nil {
+		app.shellPty.Close()
+	}
+	if app.shellCmd != nil && app.shellCmd.Process != nil {
+		app.shellCmd.Process.Kill()
+		app.shellCmd.Wait() // Prevent zombie process
+	}
 	screen.Fini()
+
+	// Clear buffers
+	app.cmdBuffer.Reset()
+	app.outputBuffer.Reset()
 
 	// Flush remaining notes
 	app.flushNotes()
-	fmt.Println("Session ended. Notes saved to incident.")
+	fmt.Println("\nSession ended. Returning to incident list...")
+	time.Sleep(500 * time.Millisecond)
 }
 
 func (app *App) fetchCurrentUser() error {
+	// First try /users/me (works with user tokens)
 	req, err := http.NewRequest("GET", app.baseURL+"/users/me", nil)
 	if err != nil {
 		return err
@@ -193,30 +381,68 @@ func (app *App) fetchCurrentUser() error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("API error %d", resp.StatusCode)
+	if resp.StatusCode == 200 {
+		var result struct {
+			User struct {
+				ID    string `json:"id"`
+				Email string `json:"email"`
+			} `json:"user"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return err
+		}
+		app.userID = result.User.ID
+		app.userEmail = result.User.Email
+		return nil
 	}
 
-	var result struct {
-		User struct {
+	// Fallback: lookup user by email from PAGERDUTY_EMAIL env var
+	email := os.Getenv("PAGERDUTY_EMAIL")
+	if email == "" {
+		return fmt.Errorf("/users/me failed and PAGERDUTY_EMAIL not set")
+	}
+
+	req2, err := http.NewRequest("GET", app.baseURL+"/users?query="+email, nil)
+	if err != nil {
+		return err
+	}
+	req2.Header.Set("Authorization", "Token token="+app.apiToken)
+	req2.Header.Set("Content-Type", "application/json")
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return err
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != 200 {
+		body, _ := io.ReadAll(resp2.Body)
+		return fmt.Errorf("user lookup failed %d: %s", resp2.StatusCode, string(body))
+	}
+
+	var usersResult struct {
+		Users []struct {
 			ID    string `json:"id"`
 			Email string `json:"email"`
-		} `json:"user"`
+		} `json:"users"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(resp2.Body).Decode(&usersResult); err != nil {
 		return err
 	}
 
-	app.userID = result.User.ID
-	app.userEmail = result.User.Email
-	fmt.Printf("User: %s (%s)\n", app.userEmail, app.userID)
-	return nil
+	// Find exact email match
+	for _, u := range usersResult.Users {
+		if strings.EqualFold(u.Email, email) {
+			app.userID = u.ID
+			app.userEmail = u.Email
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no user found with email %s", email)
 }
 
 func (app *App) selectIncident() (*Incident, error) {
-	fmt.Println("Fetching open incidents from PagerDuty...")
-	fmt.Printf("API: %s\n", app.baseURL)
-	fmt.Printf("Token: %d chars, prefix: %s...\n", len(app.apiToken), safePrefix(app.apiToken, 4))
 
 	req, err := http.NewRequest("GET", app.baseURL+"/incidents?statuses[]=triggered&statuses[]=acknowledged&limit=20", nil)
 	if err != nil {
@@ -248,25 +474,42 @@ func (app *App) selectIncident() (*Incident, error) {
 		return nil, fmt.Errorf("no open incidents found")
 	}
 
-	fmt.Println("\nOpen Incidents:")
-	fmt.Println(strings.Repeat("-", 80))
+	// ANSI colors
+	red := "\033[31m"
+	yellow := "\033[33m"
+	reset := "\033[0m"
+	bold := "\033[1m"
+
+	fmt.Println("\n" + bold + "Open Incidents:" + reset)
+	fmt.Println(strings.Repeat("-", 60))
 	for i, inc := range incResp.Incidents {
-		status := "T"
-		if inc.Status == "acknowledged" {
-			status = "A"
+		var statusColor, statusText string
+		if inc.Status == "triggered" {
+			statusColor = red
+			statusText = "TRIG"
+		} else {
+			statusColor = yellow
+			statusText = "ACK "
 		}
-		fmt.Printf("[%d] #%d [%s] %s\n    Service: %s\n",
-			i+1, inc.IncidentNum, status, inc.Title, inc.Service.Summary)
+		title := inc.Title
+		if len(title) > 50 {
+			title = title[:47] + "..."
+		}
+		fmt.Printf("%s[%d]%s %s%s%s #%d %s\n",
+			bold, i+1, reset,
+			statusColor, statusText, reset,
+			inc.IncidentNum, title)
+		fmt.Printf("    %s\n", inc.Service.Summary)
 	}
-	fmt.Println(strings.Repeat("-", 80))
+	fmt.Println(strings.Repeat("-", 60))
 
 	var choice int
 	for {
-		fmt.Print("Select incident (1-", len(incResp.Incidents), ") or 'q' to quit: ")
+		fmt.Print("Select (1-", len(incResp.Incidents), ") or q/!q to quit: ")
 		var input string
 		fmt.Scanf("%s", &input)
-		if input == "q" || input == "quit" || input == "exit" {
-			return nil, fmt.Errorf("user cancelled")
+		if input == "q" || input == "!q" || input == "quit" || input == "exit" {
+			return nil, nil // Clean exit
 		}
 		if num, err := parseNumber(input); err == nil && num >= 1 && num <= len(incResp.Incidents) {
 			choice = num
@@ -276,9 +519,9 @@ func (app *App) selectIncident() (*Incident, error) {
 	}
 
 	selected := &incResp.Incidents[choice-1]
-	fmt.Printf("\nSelected: #%d - %s\n", selected.IncidentNum, selected.Title)
-	fmt.Println("Starting troubleshooting shell...\n")
-	time.Sleep(500 * time.Millisecond)
+
+	// Session ID = userID-incidentID for continuity across sessions
+	app.sessionID = fmt.Sprintf("%s-%s", app.userID, selected.ID)
 
 	return selected, nil
 }
@@ -347,7 +590,7 @@ func (app *App) handleSignals(sigCh chan os.Signal) {
 			app.width, app.height = app.screen.Size()
 			pty.Setsize(app.shellPty, &pty.Winsize{
 				Rows: uint16(app.height - 3),
-				Cols: uint16(app.width/2 - 1),
+				Cols: uint16(app.width*6/10 - 1),
 			})
 			app.draw()
 		case syscall.SIGINT, syscall.SIGTERM:
@@ -372,11 +615,63 @@ func (app *App) run() {
 			app.screen.Sync()
 			pty.Setsize(app.shellPty, &pty.Winsize{
 				Rows: uint16(app.height - 3),
-				Cols: uint16(app.width/2 - 1),
+				Cols: uint16(app.width*6/10 - 1),
 			})
 			app.draw()
 
+		case *tcell.EventMouse:
+			// Handle mouse wheel for scrolling based on which pane cursor is in
+			mx, _ := ev.Position()
+			midX := app.width * 7 / 10
+			btn := ev.Buttons()
+
+			if btn&tcell.WheelUp != 0 {
+				if mx < midX {
+					// Left pane (shell) - scroll up
+					app.shellScroll += 3
+					if app.shellScroll > len(app.shellOutput) {
+						app.shellScroll = len(app.shellOutput)
+					}
+				} else {
+					// Right pane (SRE) - scroll up
+					app.sreScroll += 3
+					if app.sreScroll > len(app.sreOutput)*2 {
+						app.sreScroll = len(app.sreOutput) * 2
+					}
+				}
+				app.draw()
+			} else if btn&tcell.WheelDown != 0 {
+				if mx < midX {
+					// Left pane (shell) - scroll down
+					app.shellScroll -= 3
+					if app.shellScroll < 0 {
+						app.shellScroll = 0
+					}
+				} else {
+					// Right pane (SRE) - scroll down
+					app.sreScroll -= 3
+					if app.sreScroll < 0 {
+						app.sreScroll = 0
+					}
+				}
+				app.draw()
+			}
+
 		case *tcell.EventKey:
+			// Dismiss help on any key if showing
+			if app.showHelp {
+				app.showHelp = false
+				app.draw()
+				continue
+			}
+
+			// Toggle help with ?
+			if ev.Rune() == '?' {
+				app.showHelp = true
+				app.draw()
+				continue
+			}
+
 			if ev.Key() == tcell.KeyCtrlC && ev.Modifiers()&tcell.ModAlt != 0 {
 				// Alt+Ctrl+C to quit
 				close(app.quit)
@@ -396,6 +691,38 @@ func (app *App) run() {
 				continue
 			}
 
+			// Page Up/Down for scrolling active pane
+			if ev.Key() == tcell.KeyPgUp {
+				if app.inputMode == "shell" {
+					app.shellScroll += 10
+					if app.shellScroll > len(app.shellOutput) {
+						app.shellScroll = len(app.shellOutput)
+					}
+				} else {
+					app.sreScroll += 10
+					if app.sreScroll > len(app.sreOutput)*2 { // rough estimate with wrapping
+						app.sreScroll = len(app.sreOutput) * 2
+					}
+				}
+				app.draw()
+				continue
+			}
+			if ev.Key() == tcell.KeyPgDn {
+				if app.inputMode == "shell" {
+					app.shellScroll -= 10
+					if app.shellScroll < 0 {
+						app.shellScroll = 0
+					}
+				} else {
+					app.sreScroll -= 10
+					if app.sreScroll < 0 {
+						app.sreScroll = 0
+					}
+				}
+				app.draw()
+				continue
+			}
+
 			if app.inputMode == "shell" {
 				app.handleShellInput(ev)
 			} else {
@@ -407,25 +734,74 @@ func (app *App) run() {
 
 func (app *App) handleShellInput(ev *tcell.EventKey) {
 	switch ev.Key() {
+	case tcell.KeyUp:
+		// Scroll up
+		app.shellScroll += 1
+		if app.shellScroll > len(app.shellOutput) {
+			app.shellScroll = len(app.shellOutput)
+		}
+		app.draw()
+		return
+	case tcell.KeyDown:
+		// Scroll down
+		app.shellScroll -= 1
+		if app.shellScroll < 0 {
+			app.shellScroll = 0
+		}
+		app.draw()
+		return
+	case tcell.KeyLeft:
+		// If input empty or cursor at start: navigate history (older)
+		if app.inputBuffer == "" || app.cursorPos == 0 {
+			if len(app.cmdHistory) > 0 {
+				if app.historyIdx == len(app.cmdHistory) {
+					app.historyTmp = app.inputBuffer
+				}
+				if app.historyIdx > 0 {
+					app.historyIdx--
+					app.inputBuffer = app.cmdHistory[app.historyIdx]
+					app.cursorPos = len(app.inputBuffer)
+				}
+			}
+		} else {
+			// Move cursor left
+			app.cursorPos--
+		}
+		app.draw()
+		return
+	case tcell.KeyRight:
+		// If input empty or cursor at end: navigate history (newer)
+		if app.inputBuffer == "" || app.cursorPos == len(app.inputBuffer) {
+			if app.historyIdx < len(app.cmdHistory) {
+				app.historyIdx++
+				if app.historyIdx == len(app.cmdHistory) {
+					app.inputBuffer = app.historyTmp
+				} else {
+					app.inputBuffer = app.cmdHistory[app.historyIdx]
+				}
+				app.cursorPos = len(app.inputBuffer)
+			}
+		} else {
+			// Move cursor right
+			app.cursorPos++
+		}
+		app.draw()
+		return
 	case tcell.KeyEnter:
 		cmd := strings.TrimSpace(app.inputBuffer)
 
-		// Check for special commands
+		// Check for special commands - don't log these
 		if cmd == "!q" || cmd == "!quit" || cmd == "!exit" {
 			close(app.quit)
 			return
 		}
 
-		// Check for !N pattern to copy SRE command
-		if strings.HasPrefix(cmd, "!") && len(cmd) > 1 {
-			numStr := cmd[1:]
-			if num, err := parseNumber(numStr); err == nil && num >= 1 && num <= len(app.sreCommands) {
-				// Copy command from SRE suggestions
-				app.inputBuffer = app.sreCommands[num-1]
-				app.cursorPos = len(app.inputBuffer)
-				app.draw()
-				return
-			}
+		// Skip logging special commands that start with !
+		if strings.HasPrefix(cmd, "!") {
+			app.inputBuffer = ""
+			app.cursorPos = 0
+			app.draw()
+			return
 		}
 
 		// Add to history if non-empty and different from last
@@ -441,13 +817,15 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 		app.historyIdx = len(app.cmdHistory)
 		app.historyTmp = ""
 
-		// Log command before sending
+		// Log command for notes
 		if cmd != "" {
 			app.cmdBuffer.WriteString(cmd + "\n")
 		}
+		// Send to shell (shell will echo it)
 		app.shellPty.WriteString(app.inputBuffer + "\n")
 		app.inputBuffer = ""
 		app.cursorPos = 0
+		app.shellScroll = 0 // Reset scroll to show latest
 
 		// After a delay, capture output for notes
 		go func(command string) {
@@ -472,39 +850,6 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 		if app.cursorPos < len(app.inputBuffer) {
 			app.inputBuffer = app.inputBuffer[:app.cursorPos] + app.inputBuffer[app.cursorPos+1:]
 		}
-	case tcell.KeyLeft:
-		if app.cursorPos > 0 {
-			app.cursorPos--
-		}
-	case tcell.KeyRight:
-		if app.cursorPos < len(app.inputBuffer) {
-			app.cursorPos++
-		}
-	case tcell.KeyUp:
-		// Navigate command history (up = older)
-		if len(app.cmdHistory) > 0 {
-			if app.historyIdx == len(app.cmdHistory) {
-				// Save current input before navigating
-				app.historyTmp = app.inputBuffer
-			}
-			if app.historyIdx > 0 {
-				app.historyIdx--
-				app.inputBuffer = app.cmdHistory[app.historyIdx]
-				app.cursorPos = len(app.inputBuffer)
-			}
-		}
-	case tcell.KeyDown:
-		// Navigate command history (down = newer)
-		if app.historyIdx < len(app.cmdHistory) {
-			app.historyIdx++
-			if app.historyIdx == len(app.cmdHistory) {
-				// Restore saved input
-				app.inputBuffer = app.historyTmp
-			} else {
-				app.inputBuffer = app.cmdHistory[app.historyIdx]
-			}
-			app.cursorPos = len(app.inputBuffer)
-		}
 	case tcell.KeyCtrlC:
 		app.shellPty.Write([]byte{0x03})
 	case tcell.KeyCtrlD:
@@ -527,6 +872,22 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 
 func (app *App) handleSREInput(ev *tcell.EventKey) {
 	switch ev.Key() {
+	case tcell.KeyUp:
+		// Scroll up
+		app.sreScroll += 1
+		if app.sreScroll > len(app.sreOutput)*2 {
+			app.sreScroll = len(app.sreOutput) * 2
+		}
+		app.draw()
+		return
+	case tcell.KeyDown:
+		// Scroll down
+		app.sreScroll -= 1
+		if app.sreScroll < 0 {
+			app.sreScroll = 0
+		}
+		app.draw()
+		return
 	case tcell.KeyEnter:
 		query := strings.TrimSpace(app.inputBuffer)
 
@@ -541,14 +902,71 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 			query = fmt.Sprintf("what are my next steps for incident %s", app.incident.ID)
 		}
 
+		// Refresh analysis with fresh context from MCP
+		if query == "!r" || query == "!refresh" {
+			app.inputBuffer = ""
+			app.cursorPos = 0
+			go func() {
+				app.flushNotes() // Push notes first
+				app.refreshSREAnalysis()
+			}()
+			return
+		}
+
+		// Show past incidents
+		if query == "!h" || query == "!history" {
+			app.inputBuffer = ""
+			app.cursorPos = 0
+			app.addSREOutput("")
+			app.addSREOutput("PAST INCIDENTS:")
+			app.mu.Lock()
+			cache := app.pastIncidentsCache
+			app.mu.Unlock()
+			if cache != "" {
+				app.addSREOutput(formatIncidents(cache))
+			} else {
+				app.addSREOutput("  (none cached)")
+			}
+			app.draw()
+			return
+		}
+
+		// Show full analysis
+		if query == "!a" || query == "!analysis" {
+			app.inputBuffer = ""
+			app.cursorPos = 0
+			app.mu.Lock()
+			cache := app.fullAnalysisCache
+			app.mu.Unlock()
+			if cache != "" {
+				app.addSREOutput("")
+				app.addSREOutput("FULL ANALYSIS:")
+				app.addSREOutput(cache)
+			} else {
+				app.addSREOutput("  (no analysis cached yet)")
+			}
+			app.draw()
+			return
+		}
+
 		if query != "" {
 			app.addSREOutput(fmt.Sprintf("> %s", query))
-			app.addSREOutput("Thinking...")
+			app.addSREOutput("Syncing notes...")
 			app.inputBuffer = ""
 			app.cursorPos = 0
 			app.draw()
 
 			go func(q string) {
+				// Flush notes first so SRE agent has latest context
+				app.flushNotes()
+
+				app.mu.Lock()
+				if len(app.sreOutput) > 0 {
+					app.sreOutput[len(app.sreOutput)-1] = "Thinking..."
+				}
+				app.mu.Unlock()
+				app.draw()
+
 				resp, err := app.querySREAgent(q)
 				// Remove "Thinking..."
 				app.mu.Lock()
@@ -568,9 +986,17 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 	case tcell.KeyCtrlN:
 		// Shortcut for "what are my next steps"
 		app.addSREOutput("> what are my next steps?")
-		app.addSREOutput("Thinking...")
+		app.addSREOutput("Syncing notes...")
 		app.draw()
 		go func() {
+			app.flushNotes() // Push notes first
+			app.mu.Lock()
+			if len(app.sreOutput) > 0 {
+				app.sreOutput[len(app.sreOutput)-1] = "Thinking..."
+			}
+			app.mu.Unlock()
+			app.draw()
+
 			resp, err := app.querySREAgent(fmt.Sprintf("what are my next steps for incident %s", app.incident.ID))
 			app.mu.Lock()
 			if len(app.sreOutput) > 0 {
@@ -612,7 +1038,7 @@ func (app *App) draw() {
 
 	app.screen.Clear()
 	w, h := app.width, app.height
-	midX := w / 2
+	midX := w * 6 / 10 // 60% for shell, 40% for SRE
 
 	style := tcell.StyleDefault
 	borderStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
@@ -645,45 +1071,67 @@ func (app *App) draw() {
 	}
 	app.screen.SetContent(midX, 1, tcell.RuneTTee, nil, borderStyle)
 
-	// Draw shell output (left pane)
+	// Draw shell output (left pane) with scroll support
 	shellHeight := h - 4
+	totalShellLines := len(app.shellOutput)
 	startLine := 0
-	if len(app.shellOutput) > shellHeight {
-		startLine = len(app.shellOutput) - shellHeight
+	if totalShellLines > shellHeight {
+		startLine = totalShellLines - shellHeight - app.shellScroll
+		if startLine < 0 {
+			startLine = 0
+		}
 	}
-	for i, line := range app.shellOutput[startLine:] {
+	endLine := startLine + shellHeight
+	if endLine > totalShellLines {
+		endLine = totalShellLines
+	}
+	for i, line := range app.shellOutput[startLine:endLine] {
 		y := 2 + i
 		if y >= h-2 {
 			break
 		}
-		// Strip ANSI codes for display
 		cleaned := stripANSI(line)
 		if len(cleaned) > midX-1 {
 			cleaned = cleaned[:midX-1]
 		}
 		app.drawString(0, y, cleaned, style)
 	}
-
-	// Draw SRE output (right pane)
-	sreHeight := h - 4
-	startSRE := 0
-	if len(app.sreOutput) > sreHeight {
-		startSRE = len(app.sreOutput) - sreHeight
+	// Show scroll indicator for shell
+	if app.shellScroll > 0 {
+		app.drawString(midX-6, 0, fmt.Sprintf("[+%d]", app.shellScroll), statusStyle)
 	}
-	for i, line := range app.sreOutput[startSRE:] {
+
+	// Draw SRE output (right pane) with scroll and markdown
+	sreHeight := h - 4
+	// Flatten wrapped lines first
+	maxWidth := w - midX - 3
+	var sreLines []string
+	for _, line := range app.sreOutput {
+		wrapped := wrapText(line, maxWidth)
+		sreLines = append(sreLines, wrapped...)
+	}
+	totalSRELines := len(sreLines)
+	startSRE := 0
+	if totalSRELines > sreHeight {
+		startSRE = totalSRELines - sreHeight - app.sreScroll
+		if startSRE < 0 {
+			startSRE = 0
+		}
+	}
+	endSRE := startSRE + sreHeight
+	if endSRE > totalSRELines {
+		endSRE = totalSRELines
+	}
+	for i, line := range sreLines[startSRE:endSRE] {
 		y := 2 + i
 		if y >= h-2 {
 			break
 		}
-		// Word wrap for SRE pane
-		maxWidth := w - midX - 3
-		wrapped := wrapText(line, maxWidth)
-		for j, wline := range wrapped {
-			if y+j >= h-2 {
-				break
-			}
-			app.drawString(midX+2, y+j, wline, style)
-		}
+		app.drawMarkdownLine(midX+2, y, line, maxWidth)
+	}
+	// Show scroll indicator for SRE
+	if app.sreScroll > 0 {
+		app.drawString(w-8, 0, fmt.Sprintf("[+%d]", app.sreScroll), statusStyle)
 	}
 
 	// Draw bottom status bar
@@ -715,17 +1163,30 @@ func (app *App) draw() {
 	// Show cursor
 	app.screen.ShowCursor(len(prompt)+app.cursorPos, inputY)
 
-	// Help text
-	var helpText string
-	if app.inputMode == "shell" {
-		helpText = "[Tab: pane] [Up/Down: history] [!N: copy] [!q: quit]"
+	// Status message (shown for 5 seconds) or help text
+	var rightText string
+	rightStyle := tcell.StyleDefault.Foreground(tcell.ColorDarkGray)
+	if app.statusMsg != "" && time.Since(app.statusMsgTime) < 5*time.Second {
+		rightText = app.statusMsg
+		rightStyle = tcell.StyleDefault.Foreground(tcell.ColorGreen)
 	} else {
-		helpText = "[Tab: pane] [Ctrl+N: next steps] [!n: next] [!q: quit]"
+		// Clear old status
+		if app.statusMsg != "" {
+			app.statusMsg = ""
+		}
+		// Show help hints
+		if app.inputMode == "shell" {
+			rightText = "[?:help] [!q:quit]"
+		} else {
+			rightText = "[!n:next] [!r:refresh] [!q:quit]"
+		}
 	}
-	if len(helpText) > w-len(prompt)-len(app.inputBuffer)-2 {
-		helpText = "[Tab] [!q]"
+	app.drawString(w-len(rightText)-1, inputY, rightText, rightStyle)
+
+	// Draw help popup if showing
+	if app.showHelp {
+		app.drawHelpPopup()
 	}
-	app.drawString(w-len(helpText)-1, inputY, helpText, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
 
 	app.screen.Show()
 }
@@ -739,18 +1200,240 @@ func (app *App) drawString(x, y int, s string, style tcell.Style) {
 	}
 }
 
+func (app *App) drawHelpPopup() {
+	help := []string{
+		" HELP (press any key to close) ",
+		"",
+		" Tab        Switch pane",
+		" Up/Dn      Scroll",
+		" Left/Right History (shell)",
+		"",
+		" SRE:  !n next steps",
+		"       !r refresh analysis",
+		"",
+		" !q   Quit to incident list",
+	}
+
+	popupW := 42
+	popupH := len(help) + 2
+	startX := (app.width - popupW) / 2
+	startY := (app.height - popupH) / 2
+
+	boxStyle := tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
+	headerStyle := tcell.StyleDefault.Background(tcell.ColorTeal).Foreground(tcell.ColorBlack).Bold(true)
+
+	// Draw box
+	for y := 0; y < popupH; y++ {
+		for x := 0; x < popupW; x++ {
+			app.screen.SetContent(startX+x, startY+y, ' ', nil, boxStyle)
+		}
+	}
+
+	// Draw content
+	for i, line := range help {
+		style := boxStyle
+		if i == 0 {
+			style = headerStyle
+		}
+		for j, r := range line {
+			if startX+j+1 < app.width {
+				app.screen.SetContent(startX+j+1, startY+i+1, r, nil, style)
+			}
+		}
+	}
+}
+
+func (app *App) drawMarkdownLine(x, y int, s string, maxWidth int) {
+	boldStyle := tcell.StyleDefault.Bold(true).Foreground(tcell.ColorYellow)
+	headerStyle := tcell.StyleDefault.Bold(true).Foreground(tcell.ColorTeal)
+	codeStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	normalStyle := tcell.StyleDefault
+
+	col := x
+	i := 0
+	runes := []rune(s)
+
+	trimmed := strings.TrimSpace(s)
+
+	// Skip code fence markers (``` or `)
+	if trimmed == "```" || trimmed == "`" || strings.HasPrefix(trimmed, "```") {
+		return
+	}
+
+	// Check if line looks like a shell command - render in code style
+	cmdPrefixes := []string{
+		"kubectl ", "docker ", "curl ", "systemctl ", "git ", "npm ", "pip ",
+		"aws ", "gcloud ", "helm ", "terraform ", "ansible ", "ssh ", "scp ",
+		"cat ", "grep ", "tail ", "head ", "less ", "vi ", "vim ", "nano ",
+		"ls ", "cd ", "pwd ", "mkdir ", "rm ", "cp ", "mv ", "chmod ",
+		"ps ", "top ", "htop ", "kill ", "pkill ", "journalctl ", "dmesg ",
+		"ping ", "netstat ", "ss ", "nc ", "telnet ", "dig ", "nslookup ",
+		"mysql ", "psql ", "redis-cli ", "mongo ", "sqlite3 ", "$ ",
+	}
+	isCommand := false
+	for _, prefix := range cmdPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			isCommand = true
+			break
+		}
+	}
+	if isCommand {
+		displayText := trimmed
+		if strings.HasPrefix(trimmed, "$ ") {
+			displayText = trimmed[2:]
+		}
+		for _, r := range []rune(displayText) {
+			if col >= x+maxWidth || col >= app.width {
+				break
+			}
+			app.screen.SetContent(col, y, r, nil, codeStyle)
+			col++
+		}
+		return
+	}
+
+	// Check for header prefix (markdown #, ##, ###, ####, ##### or blockquote >)
+	isHeader := strings.HasPrefix(trimmed, "##### ") ||
+		strings.HasPrefix(trimmed, "#### ") ||
+		strings.HasPrefix(trimmed, "### ") ||
+		strings.HasPrefix(trimmed, "## ") ||
+		strings.HasPrefix(trimmed, "# ") ||
+		strings.HasPrefix(trimmed, ">> ") ||
+		strings.HasPrefix(trimmed, "> ")
+	if isHeader {
+		// Strip the prefix markers and draw bold/colored
+		displayText := trimmed
+		if strings.HasPrefix(trimmed, "##### ") {
+			displayText = trimmed[6:]
+		} else if strings.HasPrefix(trimmed, "#### ") {
+			displayText = trimmed[5:]
+		} else if strings.HasPrefix(trimmed, "### ") {
+			displayText = trimmed[4:]
+		} else if strings.HasPrefix(trimmed, "## ") {
+			displayText = trimmed[3:]
+		} else if strings.HasPrefix(trimmed, "# ") {
+			displayText = trimmed[2:]
+		} else if strings.HasPrefix(trimmed, ">> ") {
+			displayText = trimmed[3:]
+		} else if strings.HasPrefix(trimmed, "> ") {
+			displayText = trimmed[2:]
+		}
+		// Draw header text
+		for _, r := range []rune(displayText) {
+			if col >= x+maxWidth || col >= app.width {
+				break
+			}
+			app.screen.SetContent(col, y, r, nil, headerStyle)
+			col++
+		}
+		return
+	}
+
+	for i < len(runes) {
+		if col >= x+maxWidth || col >= app.width {
+			break
+		}
+
+		// Check for bold **text**
+		if i+1 < len(runes) && runes[i] == '*' && runes[i+1] == '*' {
+			// Find closing **
+			end := -1
+			for j := i + 2; j < len(runes)-1; j++ {
+				if runes[j] == '*' && runes[j+1] == '*' {
+					end = j
+					break
+				}
+			}
+			if end > 0 {
+				// Skip opening **
+				i += 2
+				// Draw bold text
+				for i < end && col < x+maxWidth && col < app.width {
+					app.screen.SetContent(col, y, runes[i], nil, boldStyle)
+					col++
+					i++
+				}
+				// Skip closing **
+				i += 2
+				continue
+			}
+		}
+
+		// Check for inline code `text`
+		if runes[i] == '`' {
+			end := -1
+			for j := i + 1; j < len(runes); j++ {
+				if runes[j] == '`' {
+					end = j
+					break
+				}
+			}
+			if end > 0 {
+				i++ // Skip opening `
+				for i < end && col < x+maxWidth && col < app.width {
+					app.screen.SetContent(col, y, runes[i], nil, codeStyle)
+					col++
+					i++
+				}
+				i++ // Skip closing `
+				continue
+			}
+		}
+
+		// Normal character
+		app.screen.SetContent(col, y, runes[i], nil, normalStyle)
+		col++
+		i++
+	}
+}
+
+func (app *App) addShellOutput(text string) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	clean := stripANSI(text)
+	lines := strings.Split(clean, "\n")
+	app.shellOutput = append(app.shellOutput, lines...)
+
+	// Keep buffer manageable
+	if len(app.shellOutput) > 1000 {
+		app.shellOutput = app.shellOutput[len(app.shellOutput)-500:]
+	}
+}
+
 func (app *App) addSREOutput(text string) {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
-	// Clean the text before displaying
-	clean := toASCII(stripANSI(text))
+	// Strip ANSI but keep UTF-8/markdown for rendering
+	clean := stripANSI(text)
 	lines := strings.Split(clean, "\n")
-	app.sreOutput = append(app.sreOutput, lines...)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Add blank line before headers
+		if strings.HasPrefix(trimmed, "#") ||
+			strings.HasPrefix(trimmed, "TRIAGE:") ||
+			strings.HasPrefix(trimmed, "POTENTIAL ROOT CAUSE") ||
+			strings.HasPrefix(trimmed, "NEXT STEPS") ||
+			strings.HasPrefix(trimmed, "RECENT ") ||
+			strings.HasPrefix(trimmed, "RELATED ") {
+			if len(app.sreOutput) > 0 && app.sreOutput[len(app.sreOutput)-1] != "" {
+				app.sreOutput = append(app.sreOutput, "")
+			}
+		}
+		app.sreOutput = append(app.sreOutput, line)
+	}
 
 	// Keep buffer manageable
 	if len(app.sreOutput) > 500 {
 		app.sreOutput = app.sreOutput[len(app.sreOutput)-250:]
+	}
+
+	// Debug: append to file in current dir
+	if f, err := os.OpenFile("sre_output.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		f.WriteString(text + "\n")
+		f.Close()
 	}
 }
 
@@ -768,8 +1451,8 @@ type MCPToolCall struct {
 }
 
 type MCPResponse struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      int    `json:"id"`
+	JSONRPC string      `json:"jsonrpc"`
+	ID      interface{} `json:"id"`
 	Result  struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -782,6 +1465,96 @@ type MCPResponse struct {
 	} `json:"error"`
 }
 
+func (app *App) refreshSREAnalysis() {
+	app.addSREOutput("")
+	app.addSREOutput("=== Refreshing Analysis ===")
+	app.addSREOutput("Fetching latest incident data...")
+	app.draw()
+
+	// Fetch fresh context from standard MCP
+	details, err := app.callStandardMCP("get_incident", map[string]interface{}{
+		"id": app.incident.ID,
+	})
+	if err != nil {
+		app.addSREOutput(fmt.Sprintf("  [incident error: %v]", err))
+	} else {
+		app.addSREOutput(fmt.Sprintf("  Got incident details (%d chars)", len(details)))
+	}
+	app.draw()
+
+	// Get incident notes (timeline)
+	notes, err := app.callStandardMCP("list_incident_notes", map[string]interface{}{
+		"id": app.incident.ID,
+	})
+	if err != nil {
+		app.addSREOutput(fmt.Sprintf("  [notes error: %v]", err))
+	} else {
+		app.addSREOutput(fmt.Sprintf("  Got incident notes (%d chars)", len(notes)))
+	}
+	app.draw()
+
+	// Build context for SRE agent
+	var context strings.Builder
+	context.WriteString(fmt.Sprintf("Analyze incident %s with the latest updates.\n\n", app.incident.ID))
+	if details != "" {
+		context.WriteString("Current Incident Details:\n")
+		context.WriteString(details)
+		context.WriteString("\n\n")
+	}
+	if notes != "" {
+		context.WriteString("Incident Timeline/Notes:\n")
+		context.WriteString(notes)
+		context.WriteString("\n\n")
+	}
+	context.WriteString("Based on the latest notes and timeline, what is the current status, root cause analysis, and recommended next steps?")
+
+	app.addSREOutput("")
+	app.addSREOutput("Running SRE analysis...")
+	app.draw()
+
+	// Show progress while waiting
+	done := make(chan bool)
+	go func() {
+		dots := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(1 * time.Second):
+				dots++
+				app.mu.Lock()
+				if len(app.sreOutput) > 0 {
+					app.sreOutput[len(app.sreOutput)-1] = fmt.Sprintf("Running SRE analysis%s (%ds)", strings.Repeat(".", dots%4), dots)
+				}
+				app.mu.Unlock()
+				app.draw()
+			}
+		}
+	}()
+
+	resp, err := app.querySREAgent(context.String())
+	close(done)
+
+	// Clear progress line
+	app.mu.Lock()
+	if len(app.sreOutput) > 0 {
+		app.sreOutput = app.sreOutput[:len(app.sreOutput)-1]
+	}
+	app.mu.Unlock()
+
+	if err != nil {
+		app.addSREOutput(fmt.Sprintf("Error: %v", err))
+	} else if resp == "" {
+		app.addSREOutput("(SRE agent returned empty response)")
+	} else {
+		app.addSREOutput("")
+		app.addSREOutput("=== Updated Analysis ===")
+		app.addSREOutput("")
+		app.addSREOutput(resp)
+	}
+	app.draw()
+}
+
 func (app *App) querySREAgent(query string) (string, error) {
 	mcpResponse, err := app.callAdvanceMCP(query)
 	if err != nil {
@@ -790,32 +1563,21 @@ func (app *App) querySREAgent(query string) (string, error) {
 	return app.formatMCPResponse(mcpResponse, query), nil
 }
 
-func (app *App) callAdvanceMCP(message string) (string, error) {
-	// PagerDuty Advance MCP endpoint (different from main MCP)
-	mcpURL := "https://mcp.pagerduty.com/pagerduty-advance-mcp"
+func (app *App) callStandardMCP(toolName string, arguments map[string]interface{}) (string, error) {
+	// Standard PagerDuty MCP endpoint
+	mcpURL := "https://mcp.pagerduty.com/mcp"
 
-	// Build MCP tool call request
-	args := map[string]interface{}{
-		"incident_id": app.incident.ID,
-		"message":     message,
-	}
-	// Add user ID if available (required by SRE agent)
-	if app.userID != "" {
-		args["user_id"] = app.userID
-	}
-	toolCall := MCPToolCall{
-		Name:      "sre_agent_tool",
-		Arguments: args,
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      app.userID,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name":      toolName,
+			"arguments": arguments,
+		},
 	}
 
-	mcpReq := MCPRequest{
-		JSONRPC: "2.0",
-		ID:      int(time.Now().UnixMilli()),
-		Method:  "tools/call",
-		Params:  toolCall,
-	}
-
-	body, err := json.Marshal(mcpReq)
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
 	}
@@ -824,14 +1586,9 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	// SRE agent requires user identification
-	fromEmail := os.Getenv("PAGERDUTY_EMAIL")
-	if fromEmail != "" {
-		req.Header.Set("From", fromEmail)
-	}
+	req.Header.Set("Authorization", "Token token="+app.apiToken)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -840,13 +1597,19 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("MCP error %d: %s", resp.StatusCode, string(respBody))
+		// Clean error message - strip HTML
+		errMsg := string(respBody)
+		if strings.Contains(errMsg, "<html>") {
+			errMsg = fmt.Sprintf("Server error %d", resp.StatusCode)
+		}
+		return "", fmt.Errorf("%s", errMsg)
 	}
 
 	var mcpResp MCPResponse
-	if err := json.NewDecoder(resp.Body).Decode(&mcpResp); err != nil {
+	if err := json.Unmarshal(respBody, &mcpResp); err != nil {
 		return "", err
 	}
 
@@ -854,7 +1617,7 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 		return "", fmt.Errorf("MCP error: %s", mcpResp.Error.Message)
 	}
 
-	// Extract text content from response
+	// Extract text content
 	var result strings.Builder
 	for _, content := range mcpResp.Result.Content {
 		if content.Type == "text" {
@@ -866,45 +1629,90 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 	return result.String(), nil
 }
 
-func (app *App) formatMCPResponse(response string, query string) string {
+func (app *App) callAdvanceMCP(message string) (string, error) {
+	// PagerDuty Advance MCP endpoint (trailing slash required)
+	mcpURL := "https://mcp.pagerduty.com/pagerduty-advance-mcp/"
+
+	// session_id is required for SRE agent, id might need to be user ID
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      app.userID,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name": "sre_agent_tool",
+			"arguments": map[string]interface{}{
+				"incident_id": app.incident.ID,
+				"message":     message,
+				"session_id":  app.sessionID,
+			},
+		},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", mcpURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	// Match Flutter exactly: only these 3 headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Token token="+app.apiToken)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		// Clean error message - strip HTML
+		errMsg := string(respBody)
+		if strings.Contains(errMsg, "<html>") {
+			errMsg = fmt.Sprintf("Server error %d (try again)", resp.StatusCode)
+		}
+		return "", fmt.Errorf("%s", errMsg)
+	}
+
+	// Parse response
+	var mcpResp MCPResponse
+	if err := json.Unmarshal(respBody, &mcpResp); err != nil {
+		return "", err
+	}
+
+	if mcpResp.Error != nil {
+		return "", fmt.Errorf("MCP error: %s", mcpResp.Error.Message)
+	}
+
+	// Extract text content from response
 	var result strings.Builder
-	var commands []string
-
-	result.WriteString(response)
-	result.WriteString("\n")
-
-	// Extract commands from response (lines starting with $ or common command patterns)
-	lines := strings.Split(response, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "$ ") {
-			commands = append(commands, strings.TrimPrefix(line, "$ "))
-		} else if strings.HasPrefix(line, "kubectl ") ||
-			strings.HasPrefix(line, "docker ") ||
-			strings.HasPrefix(line, "curl ") ||
-			strings.HasPrefix(line, "systemctl ") {
-			commands = append(commands, line)
-		}
-	}
-
-	// If we found commands, number them
-	if len(commands) > 0 {
-		result.WriteString("\nExtracted commands:\n")
-		for i, cmd := range commands {
-			if i >= 10 {
-				break
+	for _, content := range mcpResp.Result.Content {
+		if content.Type == "text" {
+			// The text field contains JSON with a "message" field
+			var textContent struct {
+				Message string `json:"message"`
 			}
-			result.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, cmd))
+			if err := json.Unmarshal([]byte(content.Text), &textContent); err == nil && textContent.Message != "" {
+				result.WriteString(textContent.Message)
+			} else {
+				result.WriteString(content.Text)
+			}
+			result.WriteString("\n")
 		}
-		result.WriteString("\nType !N in shell to copy command N")
 	}
 
-	// Store commands for !N feature
-	app.mu.Lock()
-	app.sreCommands = commands
-	app.mu.Unlock()
+	return result.String(), nil
+}
 
-	return result.String()
+func (app *App) formatMCPResponse(response string, query string) string {
+	// Just return the response as-is
+	return response
 }
 
 func (app *App) queueNote(content string) {
@@ -980,13 +1788,257 @@ func (app *App) flushNotes() {
 
 	if resp.StatusCode != 201 {
 		respBody, _ := io.ReadAll(resp.Body)
-		app.addSREOutput(fmt.Sprintf("[Note failed %d: %s]", resp.StatusCode, string(respBody)))
+		app.setStatus(fmt.Sprintf("Note failed: %s", string(respBody)))
 	} else {
-		app.addSREOutput(fmt.Sprintf("[Saved %d notes to incident]", count))
+		app.setStatus(fmt.Sprintf("Saved %d notes (!r to refresh)", count))
 	}
 }
 
+func (app *App) setStatus(msg string) {
+	app.mu.Lock()
+	app.statusMsg = msg
+	app.statusMsgTime = time.Now()
+	app.mu.Unlock()
+	app.draw()
+}
+
 // Helper functions
+
+func stripMarkdown(s string) string {
+	// Remove bold **text** and __text__
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "__", "")
+	// Remove italic *text* (but not bullet points)
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		// Only strip * if not a bullet point (line starting with * or -)
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "*") && !strings.HasPrefix(trimmed, "-") {
+			// Replace paired *text* with text
+			for strings.Contains(line, "*") {
+				start := strings.Index(line, "*")
+				end := strings.Index(line[start+1:], "*")
+				if end > 0 {
+					line = line[:start] + line[start+1:start+1+end] + line[start+1+end+1:]
+				} else {
+					break
+				}
+			}
+			lines[i] = line
+		}
+	}
+	s = strings.Join(lines, "\n")
+	// Remove code blocks ```
+	s = strings.ReplaceAll(s, "```bash", "")
+	s = strings.ReplaceAll(s, "```", "")
+	// Remove inline code `text`
+	s = strings.ReplaceAll(s, "`", "")
+	// Simplify headers
+	s = strings.ReplaceAll(s, "#### ", ">> ")
+	s = strings.ReplaceAll(s, "### ", ">> ")
+	s = strings.ReplaceAll(s, "## ", "> ")
+	s = strings.ReplaceAll(s, "# ", "> ")
+	// Remove link formatting [text](url) -> text (url)
+	for strings.Contains(s, "](") {
+		start := strings.Index(s, "[")
+		mid := strings.Index(s, "](")
+		end := strings.Index(s[mid:], ")")
+		if start >= 0 && mid > start && end > 0 {
+			text := s[start+1 : mid]
+			url := s[mid+2 : mid+end]
+			s = s[:start] + text + " (" + url + ")" + s[mid+end+1:]
+		} else {
+			break
+		}
+	}
+	return s
+}
+
+func formatIncidentDetails(raw string) string {
+	// Try direct object first (MCP returns it unwrapped)
+	var inc struct {
+		IncidentNumber int    `json:"incident_number"`
+		Title          string `json:"title"`
+		Summary        string `json:"summary"`
+		Status         string `json:"status"`
+		Urgency        string `json:"urgency"`
+		CreatedAt      string `json:"created_at"`
+		Service        struct {
+			Summary string `json:"summary"`
+		} `json:"service"`
+	}
+
+	if err := json.Unmarshal([]byte(raw), &inc); err == nil && inc.Title != "" {
+		var result strings.Builder
+
+		ts := inc.CreatedAt
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			ts = t.Format("Jan 2 15:04")
+		}
+
+		svc := inc.Service.Summary
+		if svc == "" {
+			svc = "unknown"
+		}
+
+		result.WriteString(fmt.Sprintf("#%d | %s | %s\n", inc.IncidentNumber, inc.Status, inc.Urgency))
+		result.WriteString(fmt.Sprintf("Service: %s\n", svc))
+		result.WriteString(fmt.Sprintf("Started: %s\n", ts))
+		result.WriteString(fmt.Sprintf("%s\n", inc.Title))
+
+		return result.String()
+	}
+
+	if len(raw) > 300 {
+		return raw[:300] + "..."
+	}
+	return raw
+}
+
+func formatChanges(raw string) string {
+	// MCP returns {"response":[...]} structure
+	var resp struct {
+		Response []struct {
+			Summary   string `json:"summary"`
+			Timestamp string `json:"timestamp"`
+			Links     []struct {
+				Href string `json:"href"`
+			} `json:"links"`
+		} `json:"response"`
+	}
+
+	if err := json.Unmarshal([]byte(raw), &resp); err == nil && len(resp.Response) > 0 {
+		var result strings.Builder
+		for _, c := range resp.Response {
+			ts := c.Timestamp
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				ts = t.Format("Jan 2 15:04")
+			}
+			// Compact: "- summary (ts)"
+			summary := c.Summary
+			if len(summary) > 50 {
+				summary = summary[:47] + "..."
+			}
+			result.WriteString(fmt.Sprintf("- %s (%s)\n", summary, ts))
+		}
+		return result.String()
+	}
+
+	// Fallback
+	if len(raw) > 300 {
+		return raw[:300] + "..."
+	}
+	return raw
+}
+
+func formatIncidentsCompact(raw string) string {
+	type Inc struct {
+		IncidentNumber int    `json:"incident_number"`
+		Title          string `json:"title"`
+		CreatedAt      string `json:"created_at"`
+		HTMLURL        string `json:"html_url"`
+	}
+
+	formatList := func(incs []Inc) string {
+		var result strings.Builder
+		for _, inc := range incs {
+			ts := inc.CreatedAt
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				ts = t.Format("Jan 2")
+			}
+			title := inc.Title
+			if len(title) > 45 {
+				title = title[:42] + "..."
+			}
+			// Compact: "- #num title (date)"
+			result.WriteString(fmt.Sprintf("- #%d %s (%s)\n", inc.IncidentNumber, title, ts))
+		}
+		return result.String()
+	}
+
+	// Try {"incidents":[...]}
+	var incidents struct {
+		Incidents []Inc `json:"incidents"`
+	}
+	if err := json.Unmarshal([]byte(raw), &incidents); err == nil && len(incidents.Incidents) > 0 {
+		return formatList(incidents.Incidents)
+	}
+
+	// Try {"response":[...]}
+	var resp struct {
+		Response []Inc `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err == nil && len(resp.Response) > 0 {
+		return formatList(resp.Response)
+	}
+
+	return ""
+}
+
+func formatIncidents(raw string) string {
+	type Inc struct {
+		IncidentNumber int    `json:"incident_number"`
+		Title          string `json:"title"`
+		CreatedAt      string `json:"created_at"`
+	}
+
+	formatList := func(incs []Inc) string {
+		var result strings.Builder
+		for _, inc := range incs {
+			ts := inc.CreatedAt
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				ts = t.Format("Jan 2")
+			}
+			title := inc.Title
+			if len(title) > 45 {
+				title = title[:42] + "..."
+			}
+			result.WriteString(fmt.Sprintf("#%-5d %s | %s\n", inc.IncidentNumber, ts, title))
+		}
+		return result.String()
+	}
+
+	// Try {"incidents":[...]}
+	var incidents struct {
+		Incidents []Inc `json:"incidents"`
+	}
+	if err := json.Unmarshal([]byte(raw), &incidents); err == nil && len(incidents.Incidents) > 0 {
+		return formatList(incidents.Incidents)
+	}
+
+	// Try {"response":[...]}
+	var resp struct {
+		Response []Inc `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err == nil && len(resp.Response) > 0 {
+		return formatList(resp.Response)
+	}
+
+	if len(raw) > 300 {
+		return raw[:300] + "..."
+	}
+	return raw
+}
+
+func prettyJSON(raw string) string {
+	// Try to parse and re-marshal with indentation
+	var data interface{}
+	if err := json.Unmarshal([]byte(raw), &data); err == nil {
+		if pretty, err := json.MarshalIndent(data, "", "  "); err == nil {
+			s := string(pretty)
+			// Truncate if too long
+			if len(s) > 2000 {
+				return s[:2000] + "\n..."
+			}
+			return s
+		}
+	}
+	// Not JSON, return as-is but truncated
+	if len(raw) > 1000 {
+		return raw[:1000] + "..."
+	}
+	return raw
+}
 
 func stripANSI(s string) string {
 	var result strings.Builder

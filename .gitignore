@@ -1,1 +1,10 @@
-tshell
+# Binaries
+sreshell
+sreshell-*
+*.exe
+
+# Debug output
+sre_output.txt
+
+# OS files
+.DS_Store
