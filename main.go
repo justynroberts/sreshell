@@ -1694,23 +1694,44 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", mcpURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	// Match Flutter exactly: only these 3 headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Token token="+app.apiToken)
-
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	// Retry logic for transient errors (EOF, connection reset, 5xx)
+	var resp *http.Response
+	var respBody []byte
+	var req *http.Request
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req, err = http.NewRequest("POST", mcpURL, bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Authorization", "Token token="+app.apiToken)
+
+		resp, err = client.Do(req)
+		if err != nil {
+			// Retry on network errors (EOF, connection reset, etc.)
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+			return "", err
+		}
+
+		respBody, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Retry on server errors (502, 503, 504)
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+		}
+		break
+	}
 
 	if resp.StatusCode != 200 {
 		// Clean error message - strip HTML
