@@ -221,9 +221,14 @@ func (app *App) selectIncident() (*Incident, error) {
 
 	var choice int
 	for {
-		fmt.Print("Select incident number (1-", len(incResp.Incidents), "): ")
-		_, err := fmt.Scanf("%d", &choice)
-		if err == nil && choice >= 1 && choice <= len(incResp.Incidents) {
+		fmt.Print("Select incident (1-", len(incResp.Incidents), ") or 'q' to quit: ")
+		var input string
+		fmt.Scanf("%s", &input)
+		if input == "q" || input == "quit" || input == "exit" {
+			return nil, fmt.Errorf("user cancelled")
+		}
+		if num, err := parseNumber(input); err == nil && num >= 1 && num <= len(incResp.Incidents) {
+			choice = num
 			break
 		}
 		fmt.Println("Invalid selection, try again.")
@@ -740,6 +745,7 @@ func (app *App) callAdvanceMCP(query string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
