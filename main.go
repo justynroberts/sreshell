@@ -364,6 +364,12 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 	case tcell.KeyEnter:
 		cmd := strings.TrimSpace(app.inputBuffer)
 
+		// Check for special commands
+		if cmd == "!q" || cmd == "!quit" || cmd == "!exit" {
+			close(app.quit)
+			return
+		}
+
 		// Check for !N pattern to copy SRE command
 		if strings.HasPrefix(cmd, "!") && len(cmd) > 1 {
 			numStr := cmd[1:]
@@ -633,9 +639,9 @@ func (app *App) draw() {
 	app.screen.ShowCursor(len(prompt)+app.cursorPos, inputY)
 
 	// Help text
-	helpText := "[Tab: pane] [Up/Down: history] [!N: copy cmd] [Alt+Ctrl+C: quit]"
+	helpText := "[Tab: pane] [Up/Down: history] [!N: copy] [!q: quit]"
 	if len(helpText) > w-len(prompt)-len(app.inputBuffer)-2 {
-		helpText = "[Tab] [!N] [Alt+Ctrl+C]"
+		helpText = "[Tab] [!N] [!q]"
 	}
 	app.drawString(w-len(helpText)-1, inputY, helpText, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
 
