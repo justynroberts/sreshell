@@ -947,8 +947,11 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 		if query == "!r" || query == "!refresh" {
 			app.inputBuffer = ""
 			app.cursorPos = 0
+			app.addSREOutput("Syncing notes...")
+			app.draw()
 			go func() {
 				app.flushNotes() // Push notes first
+				time.Sleep(2 * time.Second) // Wait for PagerDuty to index
 				app.refreshSREAnalysis()
 			}()
 			return
@@ -1000,6 +1003,8 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 			go func(q string) {
 				// Flush notes first so SRE agent has latest context
 				app.flushNotes()
+				// Wait for PagerDuty to index notes before querying
+				time.Sleep(2 * time.Second)
 
 				app.mu.Lock()
 				if len(app.sreOutput) > 0 {
@@ -1031,6 +1036,7 @@ func (app *App) handleSREInput(ev *tcell.EventKey) {
 		app.draw()
 		go func() {
 			app.flushNotes() // Push notes first
+			time.Sleep(2 * time.Second) // Wait for PagerDuty to index
 			app.mu.Lock()
 			if len(app.sreOutput) > 0 {
 				app.sreOutput[len(app.sreOutput)-1] = "Thinking..."
