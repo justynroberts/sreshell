@@ -666,7 +666,9 @@ func (app *App) addSREOutput(text string) {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
-	lines := strings.Split(text, "\n")
+	// Clean the text before displaying
+	clean := toASCII(stripANSI(text))
+	lines := strings.Split(clean, "\n")
 	app.sreOutput = append(app.sreOutput, lines...)
 
 	// Keep buffer manageable
@@ -819,9 +821,14 @@ func (app *App) formatMCPResponse(response string, query string) string {
 }
 
 func (app *App) queueNote(content string) {
+	// Clean content: strip ANSI codes and convert to ASCII only
+	clean := toASCII(stripANSI(content))
+	if strings.TrimSpace(clean) == "" {
+		return
+	}
 	app.noteMu.Lock()
 	defer app.noteMu.Unlock()
-	app.noteQueue = append(app.noteQueue, content)
+	app.noteQueue = append(app.noteQueue, clean)
 }
 
 func (app *App) noteFlushLoop() {
@@ -897,18 +904,46 @@ func (app *App) flushNotes() {
 func stripANSI(s string) string {
 	var result strings.Builder
 	inEscape := false
+	inCSI := false
 	for _, r := range s {
 		if r == '\x1b' {
 			inEscape = true
 			continue
 		}
 		if inEscape {
+			if r == '[' {
+				inCSI = true
+				continue
+			}
+			if inCSI {
+				// CSI sequence ends with a letter
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+					inEscape = false
+					inCSI = false
+				}
+				continue
+			}
+			// Non-CSI escape sequence
 			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 				inEscape = false
 			}
 			continue
 		}
 		result.WriteRune(r)
+	}
+	return result.String()
+}
+
+func toASCII(s string) string {
+	var result strings.Builder
+	for _, r := range s {
+		// Keep printable ASCII and common whitespace
+		if (r >= 32 && r <= 126) || r == '\n' || r == '\t' {
+			result.WriteRune(r)
+		} else if r == '\r' {
+			// Skip carriage returns
+			continue
+		}
 	}
 	return result.String()
 }
