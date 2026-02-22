@@ -57,6 +57,8 @@ type App struct {
 	screen       tcell.Screen
 	apiToken     string
 	baseURL      string
+	userID       string
+	userEmail    string
 	incident     *Incident
 	shellCmd     *exec.Cmd
 	shellPty     *os.File
@@ -105,6 +107,11 @@ func main() {
 		baseURL:   baseURL,
 		inputMode: "shell",
 		quit:      make(chan struct{}),
+	}
+
+	// Fetch current user ID for SRE agent
+	if err := app.fetchCurrentUser(); err != nil {
+		fmt.Printf("Warning: Could not fetch user: %v\n", err)
 	}
 
 	// Fetch and select incident
@@ -170,6 +177,40 @@ func main() {
 	// Flush remaining notes
 	app.flushNotes()
 	fmt.Println("Session ended. Notes saved to incident.")
+}
+
+func (app *App) fetchCurrentUser() error {
+	req, err := http.NewRequest("GET", app.baseURL+"/users/me", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Token token="+app.apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("API error %d", resp.StatusCode)
+	}
+
+	var result struct {
+		User struct {
+			ID    string `json:"id"`
+			Email string `json:"email"`
+		} `json:"user"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	app.userID = result.User.ID
+	app.userEmail = result.User.Email
+	fmt.Printf("User: %s (%s)\n", app.userEmail, app.userID)
+	return nil
 }
 
 func (app *App) selectIncident() (*Incident, error) {
@@ -754,12 +795,17 @@ func (app *App) callAdvanceMCP(message string) (string, error) {
 	mcpURL := "https://mcp.pagerduty.com/pagerduty-advance-mcp"
 
 	// Build MCP tool call request
+	args := map[string]interface{}{
+		"incident_id": app.incident.ID,
+		"message":     message,
+	}
+	// Add user ID if available (required by SRE agent)
+	if app.userID != "" {
+		args["user_id"] = app.userID
+	}
 	toolCall := MCPToolCall{
-		Name: "sre_agent_tool",
-		Arguments: map[string]interface{}{
-			"incident_id": app.incident.ID,
-			"message":     message,
-		},
+		Name:      "sre_agent_tool",
+		Arguments: args,
 	}
 
 	mcpReq := MCPRequest{
