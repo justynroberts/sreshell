@@ -1,12 +1,12 @@
 # SREShell
 
-A split-pane troubleshooting shell that connects to PagerDuty incidents. Run commands on the left, get AI-powered SRE analysis on the right.
+A split-pane troubleshooting shell for PagerDuty incidents. Run commands on the left, get AI-powered SRE analysis on the right.
 
 **Repository**: https://github.com/justynroberts/sreshell
 
-## Quick Start (5 minutes)
+## Quick Start
 
-### Step 1: Download SREShell
+### 1. Download
 
 ```bash
 # macOS (Apple Silicon)
@@ -22,137 +22,54 @@ curl -L https://github.com/justynroberts/sreshell/releases/latest/download/sresh
 chmod +x sreshell
 ```
 
-### Step 2: Get PagerDuty Token
-
-You only need **one** token. User Token is recommended.
-
-1. Log into PagerDuty
-2. Go to **My Profile** → **User Settings** → **Create API User Token**
-3. Copy the token (starts with `u+...`)
-
-### Step 3: Configure Shell
+### 2. Configure
 
 ```bash
-# Add to ~/.zshrc (or ~/.bashrc)
-echo 'export PAGERDUTY_USER_TOKEN="YOUR_TOKEN_HERE"' >> ~/.zshrc
-source ~/.zshrc
+# Get a PagerDuty User Token:
+# PagerDuty -> My Profile -> User Settings -> Create API User Token
+
+# Add to your shell config (~/.zshrc or ~/.bashrc)
+export PAGERDUTY_USER_TOKEN="u+your-token-here"
 ```
 
-### Step 4: Install to PATH
+### 3. Install (optional)
 
 ```bash
-# Move to a directory in your PATH
 sudo mv sreshell /usr/local/bin/
-
-# Or user-only install
-mkdir -p ~/bin && mv sreshell ~/bin/
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+# Or: mv sreshell ~/bin/
 ```
 
-### Step 5: Run
+### 4. Run
 
 ```bash
 sreshell
 ```
-
-Select an incident and start troubleshooting.
-
----
 
 ## Features
 
-- **Split-pane TUI**: Shell on left (60%), SRE agent on right (40%)
-- **Tmux Integration**: Uses tmux for full shell experience (prompt, aliases, colors)
-- **PagerDuty Integration**: Select from open incidents, auto-sync notes
-- **SRE Triage**: Automatic root cause analysis and numbered next steps
-- **Command History**: Left/Right arrows navigate history
-- **Note Sync**: Shell commands automatically saved to incident notes
+- **Split-pane TUI** - Shell (60%) + SRE agent (40%)
+- **Tmux integration** - Full shell experience with your prompt, aliases, colors
+- **Auto-triage** - Root cause analysis and numbered next steps on incident load
+- **Note sync** - Commands saved to incident notes (individually, not batched)
+- **Retry logic** - Auto-retries on network errors and 5xx responses
+- **Color-coded incidents** - Red (triggered), Yellow (acknowledged)
 
-## Prerequisites
+## Requirements
 
-- Go 1.21+ (for building from source)
 - PagerDuty account with API access
-- PagerDuty Advance license (for SRE AI features)
-- tmux (optional but recommended - falls back to basic shell if not available)
+- PagerDuty Advance license (for AI features)
+- tmux (recommended) - `brew install tmux` or `apt install tmux`
 
-## Dependencies
+## Environment Variables
 
-| Package | Purpose |
-|---------|---------|
-| `github.com/gdamore/tcell/v2` | Terminal UI framework |
-| `github.com/creack/pty` | PTY handling for shell |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PAGERDUTY_USER_TOKEN` | Yes* | User API token (recommended) |
+| `PAGERDUTY_TOKEN` | Yes* | Alternative: general API token |
+| `PAGERDUTY_REGION` | No | Set to `eu` for EU region |
+| `PAGERDUTY_EMAIL` | No | Email for note attribution |
 
-## Installation
-
-### From Source
-
-```bash
-# Clone repository
-git clone <repo>
-cd sreshell
-
-# Install dependencies
-go mod tidy
-
-# Build
-go build -o sreshell main.go
-
-# Install to PATH (choose one)
-sudo cp sreshell /usr/local/bin/
-# or
-cp sreshell ~/bin/  # if ~/bin is in PATH
-# or
-cp sreshell /opt/homebrew/bin/  # macOS with Homebrew
-```
-
-### Verify Installation
-
-```bash
-which sreshell
-sreshell --help  # Currently just runs - no help flag yet
-```
-
-## Configuration
-
-### Required Environment Variables
-
-```bash
-# Add to ~/.bashrc, ~/.zshrc, or ~/.profile
-
-# PagerDuty API Token (User Token recommended for full access)
-export PAGERDUTY_USER_TOKEN="your-token-here"
-
-# OR use a general API token
-export PAGERDUTY_TOKEN="your-token-here"
-```
-
-### Optional Environment Variables
-
-```bash
-# For EU region
-export PAGERDUTY_REGION="eu"
-
-# Email for note attribution (if using service account token)
-export PAGERDUTY_EMAIL="your-email@company.com"
-```
-
-### Getting a PagerDuty Token
-
-1. Go to PagerDuty → My Profile → User Settings
-2. Create a User API Token
-3. Copy and add to your shell config
-
-## Usage
-
-```bash
-# Start sreshell
-sreshell
-
-# Select an incident from the list
-[1] TRIG #1234 Kubernetes OOM killer...
-[2] ACK  #1230 High CPU alert
-Select (1-2) or q/!q to quit: 1
-```
+*One of `PAGERDUTY_USER_TOKEN` or `PAGERDUTY_TOKEN` is required.
 
 ## Keyboard Controls
 
@@ -162,121 +79,77 @@ Select (1-2) or q/!q to quit: 1
 | `Up/Down` | Scroll active pane |
 | `Left/Right` | Command history (shell pane) |
 | `PgUp/PgDn` | Fast scroll |
+| `Ctrl+N` | Ask for next steps (SRE pane) |
 | `?` | Show help popup |
 
 ## Commands
 
 ### Shell Pane
+
 | Command | Action |
 |---------|--------|
-| `!q` | Quit to incident list |
+| `!q` | Return to incident list |
+| Any command | Runs in shell, saved to notes |
 
 ### SRE Pane
+
 | Command | Action |
 |---------|--------|
-| `!n` | Ask for next steps |
+| `!n` | Get next steps |
 | `!r` | Refresh analysis (syncs notes first) |
 | `!h` | Show related past incidents |
-| `!q` | Quit to incident list |
-| Any text | Ask the SRE agent a question |
+| `!q` | Return to incident list |
+| Any text | Ask the SRE agent |
 
 ## How It Works
 
-1. **Incident Selection**: Shows open PagerDuty incidents with color-coded status
-2. **Initial Triage**: Fetches incident details, recent changes, related incidents
-3. **SRE Analysis**: Sends context to PagerDuty Advance AI for root cause and next steps
-4. **Command Capture**: Shell commands and output saved to incident notes
-5. **Continuous Analysis**: Ask follow-up questions, notes sync before each query
+1. **Select incident** - Choose from open incidents (color-coded by status)
+2. **Auto-triage** - Fetches context, runs initial analysis with root cause + next steps
+3. **Run commands** - Shell commands are captured and saved to incident notes
+4. **Ask questions** - Notes sync before each SRE query (2s delay for indexing)
+5. **Iterate** - Continue troubleshooting with full context preserved
 
-## Shell Integration
-
-### Bash (~/.bashrc)
+## Building from Source
 
 ```bash
-export PAGERDUTY_USER_TOKEN="your-token"
-
-# Optional alias
-alias sre="sreshell"
+git clone https://github.com/justynroberts/sreshell.git
+cd sreshell
+go build -o sreshell main.go
 ```
 
-### Zsh (~/.zshrc)
+### Cross-compile
 
 ```bash
-export PAGERDUTY_USER_TOKEN="your-token"
+# macOS Apple Silicon
+GOOS=darwin GOARCH=arm64 go build -o sreshell-darwin-arm64 main.go
 
-# Optional alias
-alias sre="sreshell"
+# macOS Intel
+GOOS=darwin GOARCH=amd64 go build -o sreshell-darwin-amd64 main.go
 
-# Optional: function to start with incident number
-srei() {
-  echo "$1" | sreshell
-}
-```
-
-### Fish (~/.config/fish/config.fish)
-
-```fish
-set -gx PAGERDUTY_USER_TOKEN "your-token"
-
-# Optional alias
-alias sre="sreshell"
+# Linux x86_64
+GOOS=linux GOARCH=amd64 go build -o sreshell-linux-amd64 main.go
 ```
 
 ## Troubleshooting
 
 ### "no open incidents found"
-- Check your PagerDuty token has access to incidents
-- Verify there are triggered/acknowledged incidents
+- Verify your token has incident access
+- Check there are triggered/acknowledged incidents in PagerDuty
 
-### "Server error 502"
+### "Server error 502" or "EOF"
 - PagerDuty Advance API temporarily unavailable
-- Tool auto-retries 3 times, or use `!r` to retry manually
+- Auto-retries 3 times with backoff
+- Use `!r` to retry manually
 
-### Notes not syncing
-- Ensure PAGERDUTY_EMAIL is set if using service account token
-- Notes sync every 30 seconds or when asking SRE questions
-
-### Tmux not working
+### Shell doesn't show my prompt/colors
 - Install tmux: `brew install tmux` (macOS) or `apt install tmux` (Linux)
-- SREShell falls back to basic shell if tmux is not installed
-- Your prompt, aliases, and shell settings require tmux
+- SREShell uses tmux for full shell experience
+- Falls back to basic shell if tmux unavailable
 
-## Source Code
-
-```
-sreshell/
-├── main.go          # Main application (~2100 lines)
-├── go.mod           # Go module definition
-├── go.sum           # Dependency checksums
-└── README.md        # This file
-```
-
-### Key Components
-
-| Function | Description |
-|----------|-------------|
-| `main()` | Entry point, incident selection loop |
-| `runIncidentSession()` | TUI session for single incident |
-| `selectIncident()` | Colored incident picker |
-| `handleShellInput()` | Shell pane input handling |
-| `handleSREInput()` | SRE pane input handling |
-| `querySREAgent()` | PagerDuty Advance MCP calls |
-| `callStandardMCP()` | Standard PagerDuty MCP calls |
-| `flushNotes()` | Sync commands to incident notes |
-| `draw()` | TUI rendering |
-
-### Building for Different Platforms
-
-```bash
-# macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -o sreshell-darwin-arm64 main.go
-
-# macOS (Intel)
-GOOS=darwin GOARCH=amd64 go build -o sreshell-darwin-amd64 main.go
-
-# Linux
-GOOS=linux GOARCH=amd64 go build -o sreshell-linux-amd64 main.go
-```
+### Notes not appearing in PagerDuty
+- Notes sync every 30 seconds or before SRE queries
+- Each command+response is saved as a separate note
+- Shell prompts are automatically stripped from notes
 
 ## License
 
