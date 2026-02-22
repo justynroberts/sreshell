@@ -56,6 +56,7 @@ type SREAgentResponse struct {
 type App struct {
 	screen       tcell.Screen
 	apiToken     string
+	baseURL      string
 	incident     *Incident
 	shellCmd     *exec.Cmd
 	shellPty     *os.File
@@ -83,14 +84,25 @@ type App struct {
 }
 
 func main() {
-	token := os.Getenv("PAGERDUTY_TOKEN")
+	token := strings.TrimSpace(os.Getenv("PAGERDUTY_TOKEN"))
 	if token == "" {
 		fmt.Println("Error: PAGERDUTY_TOKEN environment variable required")
 		os.Exit(1)
 	}
+	// Strip quotes and common mistakes
+	token = strings.Trim(token, "\"'`")
+	token = strings.TrimPrefix(token, "token=")
+	token = strings.TrimPrefix(token, "Token token=")
+
+	// Support EU region
+	baseURL := "https://api.pagerduty.com"
+	if os.Getenv("PAGERDUTY_REGION") == "eu" {
+		baseURL = "https://api.eu.pagerduty.com"
+	}
 
 	app := &App{
 		apiToken:  token,
+		baseURL:   baseURL,
 		inputMode: "shell",
 		quit:      make(chan struct{}),
 	}
@@ -162,8 +174,10 @@ func main() {
 
 func (app *App) selectIncident() (*Incident, error) {
 	fmt.Println("Fetching open incidents from PagerDuty...")
+	fmt.Printf("API: %s\n", app.baseURL)
+	fmt.Printf("Token: %d chars, prefix: %s...\n", len(app.apiToken), safePrefix(app.apiToken, 4))
 
-	req, err := http.NewRequest("GET", "https://api.pagerduty.com/incidents?statuses[]=triggered&statuses[]=acknowledged&limit=20", nil)
+	req, err := http.NewRequest("GET", app.baseURL+"/incidents?statuses[]=triggered&statuses[]=acknowledged&limit=20", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +192,9 @@ func (app *App) selectIncident() (*Incident, error) {
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
+		if len(body) == 0 {
+			return nil, fmt.Errorf("API error %d (no response body)\nCheck: https://support.pagerduty.com/main/docs/api-access-keys", resp.StatusCode)
+		}
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -647,54 +664,161 @@ func (app *App) addSREOutput(text string) {
 	}
 }
 
-func (app *App) querySREAgent(query string) (string, error) {
-	// Query PagerDuty Advance SRE Agent
-	// Using the incident analysis endpoint with context
-	url := fmt.Sprintf("https://api.pagerduty.com/incidents/%s/past_incidents", app.incident.ID)
+// MCP JSON-RPC request/response types
+type MCPRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      int         `json:"id"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+}
 
-	req, err := http.NewRequest("GET", url, nil)
+type MCPToolCall struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
+}
+
+type MCPResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func (app *App) querySREAgent(query string) (string, error) {
+	// Try PagerDuty Advance MCP endpoint first
+	mcpResponse, err := app.callAdvanceMCP(query)
+	if err == nil && mcpResponse != "" {
+		return app.formatMCPResponse(mcpResponse, query), nil
+	}
+
+	// Fallback to local suggestions if MCP fails
+	return app.localSREFallback(query, err), nil
+}
+
+func (app *App) callAdvanceMCP(query string) (string, error) {
+	// PagerDuty Advance MCP endpoint
+	mcpURL := "https://mcp.pagerduty.com/mcp"
+
+	// Build MCP tool call request
+	toolCall := MCPToolCall{
+		Name: "sre_agent_tool",
+		Arguments: map[string]interface{}{
+			"incident_id": app.incident.ID,
+			"query":       query,
+		},
+	}
+
+	mcpReq := MCPRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  toolCall,
+	}
+
+	body, err := json.Marshal(mcpReq)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", mcpURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	var pastIncidents struct {
-		PastIncidents []struct {
-			Incident struct {
-				Title  string `json:"title"`
-				Status string `json:"status"`
-			} `json:"incident"`
-			Score int `json:"score"`
-		} `json:"past_incidents"`
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("MCP error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	if resp.StatusCode == 200 {
-		json.NewDecoder(resp.Body).Decode(&pastIncidents)
+	var mcpResp MCPResponse
+	if err := json.NewDecoder(resp.Body).Decode(&mcpResp); err != nil {
+		return "", err
 	}
 
-	// Build context-aware response with numbered commands
+	if mcpResp.Error != nil {
+		return "", fmt.Errorf("MCP error: %s", mcpResp.Error.Message)
+	}
+
+	// Extract text content from response
+	var result strings.Builder
+	for _, content := range mcpResp.Result.Content {
+		if content.Type == "text" {
+			result.WriteString(content.Text)
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String(), nil
+}
+
+func (app *App) formatMCPResponse(response string, query string) string {
+	var result strings.Builder
+	var commands []string
+
+	result.WriteString(response)
+	result.WriteString("\n")
+
+	// Extract commands from response (lines starting with $ or common command patterns)
+	lines := strings.Split(response, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "$ ") {
+			commands = append(commands, strings.TrimPrefix(line, "$ "))
+		} else if strings.HasPrefix(line, "kubectl ") ||
+			strings.HasPrefix(line, "docker ") ||
+			strings.HasPrefix(line, "curl ") ||
+			strings.HasPrefix(line, "systemctl ") {
+			commands = append(commands, line)
+		}
+	}
+
+	// If we found commands, number them
+	if len(commands) > 0 {
+		result.WriteString("\nExtracted commands:\n")
+		for i, cmd := range commands {
+			if i >= 10 {
+				break
+			}
+			result.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, cmd))
+		}
+		result.WriteString("\nType !N in shell to copy command N")
+	}
+
+	// Store commands for !N feature
+	app.mu.Lock()
+	app.sreCommands = commands
+	app.mu.Unlock()
+
+	return result.String()
+}
+
+func (app *App) localSREFallback(query string, mcpErr error) string {
 	var response strings.Builder
 	var commands []string
 
-	response.WriteString(fmt.Sprintf("Incident: %s\n\n", app.incident.Title))
-
-	if len(pastIncidents.PastIncidents) > 0 {
-		response.WriteString("Similar past incidents:\n")
-		for i, pi := range pastIncidents.PastIncidents {
-			if i >= 3 {
-				break
-			}
-			response.WriteString(fmt.Sprintf("- %s (%d%% similar)\n", pi.Incident.Title, pi.Score))
-		}
-		response.WriteString("\n")
+	if mcpErr != nil {
+		response.WriteString(fmt.Sprintf("[MCP unavailable: %v]\n", mcpErr))
+		response.WriteString("Using local suggestions:\n\n")
 	}
+
+	response.WriteString(fmt.Sprintf("Incident: %s\n\n", app.incident.Title))
 
 	// Add query-specific guidance with numbered commands
 	queryLower := strings.ToLower(query)
@@ -761,7 +885,7 @@ func (app *App) querySREAgent(query string) (string, error) {
 
 	response.WriteString("\nType !N in shell to copy command N")
 
-	return response.String(), nil
+	return response.String()
 }
 
 func (app *App) queueNote(content string) {
@@ -793,6 +917,7 @@ func (app *App) flushNotes() {
 
 	// Combine all queued notes
 	combined := strings.Join(app.noteQueue, "\n---\n")
+	count := len(app.noteQueue)
 	app.noteQueue = nil
 	app.noteMu.Unlock()
 
@@ -806,21 +931,35 @@ func (app *App) flushNotes() {
 	noteReq.Note.Content = combined
 
 	body, _ := json.Marshal(noteReq)
-	url := fmt.Sprintf("https://api.pagerduty.com/incidents/%s/notes", app.incident.ID)
+	url := fmt.Sprintf("%s/incidents/%s/notes", app.baseURL, app.incident.ID)
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
+		app.addSREOutput(fmt.Sprintf("[Note error: %v]", err))
 		return
 	}
 	req.Header.Set("Authorization", "Token token="+app.apiToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("From", "tshell@automated.local")
+	// From header required - use PAGERDUTY_EMAIL env var or default
+	fromEmail := os.Getenv("PAGERDUTY_EMAIL")
+	if fromEmail == "" {
+		fromEmail = "tshell@local"
+	}
+	req.Header.Set("From", fromEmail)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		app.addSREOutput(fmt.Sprintf("[Note error: %v]", err))
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		respBody, _ := io.ReadAll(resp.Body)
+		app.addSREOutput(fmt.Sprintf("[Note failed %d: %s]", resp.StatusCode, string(respBody)))
+	} else {
+		app.addSREOutput(fmt.Sprintf("[Saved %d notes to incident]", count))
+	}
 }
 
 // Helper functions
@@ -880,4 +1019,11 @@ func parseNumber(s string) (int, error) {
 		n = n*10 + int(r-'0')
 	}
 	return n, nil
+}
+
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
