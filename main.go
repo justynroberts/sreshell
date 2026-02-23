@@ -93,6 +93,13 @@ type App struct {
 	statusMsgTime time.Time
 	// Tmux session name for shell
 	tmuxSession string
+	// Mouse selection state
+	selecting    bool
+	selStartX    int
+	selStartY    int
+	selEndX      int
+	selEndY      int
+	selPane      string // "shell" or "sre" - which pane selection started in
 }
 
 func main() {
@@ -172,8 +179,8 @@ func (app *App) runIncidentSession() {
 		fmt.Printf("Error initializing screen: %v\n", err)
 		return
 	}
-	// Mouse disabled to allow normal terminal text selection/copy
-	// Use PgUp/PgDn or arrow keys to scroll
+	// Enable mouse for pane-isolated selection and scrolling
+	screen.EnableMouse()
 	app.screen = screen
 	app.width, app.height = screen.Size()
 
@@ -646,20 +653,24 @@ func (app *App) run() {
 			app.draw()
 
 		case *tcell.EventMouse:
-			// Handle mouse wheel for scrolling based on which pane cursor is in
-			mx, _ := ev.Position()
-			midX := app.width * 7 / 10
+			mx, my := ev.Position()
+			shellWidth := app.width * 6 / 10
 			btn := ev.Buttons()
 
+			// Determine which pane mouse is in
+			mousePane := "shell"
+			if mx >= shellWidth {
+				mousePane = "sre"
+			}
+
+			// Handle mouse wheel for scrolling
 			if btn&tcell.WheelUp != 0 {
-				if mx < midX {
-					// Left pane (shell) - scroll up
+				if mousePane == "shell" {
 					app.shellScroll += 3
 					if app.shellScroll > len(app.shellOutput) {
 						app.shellScroll = len(app.shellOutput)
 					}
 				} else {
-					// Right pane (SRE) - scroll up
 					app.sreScroll += 3
 					if app.sreScroll > len(app.sreOutput)*2 {
 						app.sreScroll = len(app.sreOutput) * 2
@@ -667,19 +678,38 @@ func (app *App) run() {
 				}
 				app.draw()
 			} else if btn&tcell.WheelDown != 0 {
-				if mx < midX {
-					// Left pane (shell) - scroll down
+				if mousePane == "shell" {
 					app.shellScroll -= 3
 					if app.shellScroll < 0 {
 						app.shellScroll = 0
 					}
 				} else {
-					// Right pane (SRE) - scroll down
 					app.sreScroll -= 3
 					if app.sreScroll < 0 {
 						app.sreScroll = 0
 					}
 				}
+				app.draw()
+			} else if btn&tcell.Button1 != 0 {
+				// Left button pressed or dragging
+				if !app.selecting {
+					// Start selection
+					app.selecting = true
+					app.selPane = mousePane
+					app.selStartX = mx
+					app.selStartY = my
+					app.selEndX = mx
+					app.selEndY = my
+				} else if app.selPane == mousePane {
+					// Continue selection within same pane
+					app.selEndX = mx
+					app.selEndY = my
+				}
+				app.draw()
+			} else if app.selecting {
+				// Button released - copy selection and clear
+				app.copySelection()
+				app.selecting = false
 				app.draw()
 			}
 
@@ -863,10 +893,12 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 
 			// Only save note if there was an actual command
 			if command != "" {
-				// Strip trailing prompt lines from output
+				// Strip prompt lines from output
 				output = stripTrailingPrompt(output)
-				if output != "" || command != "" {
-					note := fmt.Sprintf("$ %s\n%s", command, strings.TrimSpace(output))
+				output = strings.TrimSpace(output)
+				// Only queue if there's actual output (not just prompts)
+				if output != "" {
+					note := fmt.Sprintf("$ %s\n%s", command, output)
 					app.queueNote(note)
 				}
 			}
@@ -1141,7 +1173,7 @@ func (app *App) draw() {
 		if len(cleaned) > midX-1 {
 			cleaned = cleaned[:midX-1]
 		}
-		app.drawString(0, y, cleaned, style)
+		app.drawStringWithSelection(0, y, cleaned, style, "shell")
 	}
 	// Show scroll indicator for shell
 	if app.shellScroll > 0 {
@@ -1174,7 +1206,7 @@ func (app *App) draw() {
 		if y >= h-2 {
 			break
 		}
-		app.drawMarkdownLine(midX+2, y, line, maxWidth)
+		app.drawMarkdownLineWithSelection(midX+2, y, line, maxWidth)
 	}
 	// Show scroll indicator for SRE
 	if app.sreScroll > 0 {
@@ -1245,6 +1277,177 @@ func (app *App) drawString(x, y int, s string, style tcell.Style) {
 		}
 		app.screen.SetContent(x+i, y, r, nil, style)
 	}
+}
+
+func (app *App) drawStringWithSelection(x, y int, s string, style tcell.Style, pane string) {
+	selStyle := tcell.StyleDefault.Background(tcell.ColorBlue).Foreground(tcell.ColorWhite)
+	for i, r := range s {
+		px := x + i
+		if px >= app.width {
+			break
+		}
+		charStyle := style
+		if app.selecting && app.selPane == pane && app.isInSelection(px, y) {
+			charStyle = selStyle
+		}
+		app.screen.SetContent(px, y, r, nil, charStyle)
+	}
+}
+
+func (app *App) isInSelection(x, y int) bool {
+	// Normalize selection coordinates (start <= end)
+	startY, endY := app.selStartY, app.selEndY
+	startX, endX := app.selStartX, app.selEndX
+	if startY > endY || (startY == endY && startX > endX) {
+		startY, endY = endY, startY
+		startX, endX = endX, startX
+	}
+
+	if y < startY || y > endY {
+		return false
+	}
+	if y == startY && y == endY {
+		return x >= startX && x <= endX
+	}
+	if y == startY {
+		return x >= startX
+	}
+	if y == endY {
+		return x <= endX
+	}
+	return true
+}
+
+func (app *App) copySelection() {
+	if !app.selecting {
+		return
+	}
+
+	// Get selection bounds
+	startY, endY := app.selStartY, app.selEndY
+	startX, endX := app.selStartX, app.selEndX
+	if startY > endY || (startY == endY && startX > endX) {
+		startY, endY = endY, startY
+		startX, endX = endX, startX
+	}
+
+	shellWidth := app.width * 6 / 10
+	var lines []string
+
+	if app.selPane == "shell" {
+		// Get visible shell lines
+		shellHeight := app.height - 4
+		totalLines := len(app.shellOutput)
+		viewStart := 0
+		if totalLines > shellHeight {
+			viewStart = totalLines - shellHeight - app.shellScroll
+			if viewStart < 0 {
+				viewStart = 0
+			}
+		}
+
+		for screenY := startY; screenY <= endY; screenY++ {
+			lineIdx := viewStart + (screenY - 2)
+			if lineIdx < 0 || lineIdx >= len(app.shellOutput) {
+				continue
+			}
+			line := stripANSI(app.shellOutput[lineIdx])
+			if len(line) > shellWidth-1 {
+				line = line[:shellWidth-1]
+			}
+
+			// Extract selected portion
+			lineStartX := 0
+			lineEndX := len(line)
+			if screenY == startY {
+				lineStartX = startX
+			}
+			if screenY == endY {
+				lineEndX = endX + 1
+			}
+			if lineStartX < 0 {
+				lineStartX = 0
+			}
+			if lineEndX > len(line) {
+				lineEndX = len(line)
+			}
+			if lineStartX < lineEndX {
+				lines = append(lines, line[lineStartX:lineEndX])
+			}
+		}
+	} else {
+		// Get visible SRE lines (account for wrapping)
+		maxWidth := app.width - shellWidth - 3
+		var sreLines []string
+		for _, line := range app.sreOutput {
+			wrapped := wrapText(line, maxWidth)
+			sreLines = append(sreLines, wrapped...)
+		}
+
+		sreHeight := app.height - 4
+		totalLines := len(sreLines)
+		viewStart := 0
+		if totalLines > sreHeight {
+			viewStart = totalLines - sreHeight - app.sreScroll
+			if viewStart < 0 {
+				viewStart = 0
+			}
+		}
+
+		for screenY := startY; screenY <= endY; screenY++ {
+			lineIdx := viewStart + (screenY - 2)
+			if lineIdx < 0 || lineIdx >= len(sreLines) {
+				continue
+			}
+			line := sreLines[lineIdx]
+
+			// Adjust X coordinates for SRE pane offset
+			adjStartX := startX - (shellWidth + 2)
+			adjEndX := endX - (shellWidth + 2)
+
+			lineStartX := 0
+			lineEndX := len(line)
+			if screenY == startY {
+				lineStartX = adjStartX
+			}
+			if screenY == endY {
+				lineEndX = adjEndX + 1
+			}
+			if lineStartX < 0 {
+				lineStartX = 0
+			}
+			if lineEndX > len(line) {
+				lineEndX = len(line)
+			}
+			if lineStartX < lineEndX {
+				lines = append(lines, line[lineStartX:lineEndX])
+			}
+		}
+	}
+
+	if len(lines) == 0 {
+		return
+	}
+
+	text := strings.Join(lines, "\n")
+	app.copyToClipboard(text)
+}
+
+func (app *App) copyToClipboard(text string) {
+	// Try pbcopy (macOS) first, then xclip (Linux)
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("pbcopy"); err == nil {
+		cmd = exec.Command("pbcopy")
+	} else if _, err := exec.LookPath("xclip"); err == nil {
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	} else if _, err := exec.LookPath("xsel"); err == nil {
+		cmd = exec.Command("xsel", "--clipboard", "--input")
+	} else {
+		return // No clipboard command available
+	}
+
+	cmd.Stdin = strings.NewReader(text)
+	cmd.Run()
 }
 
 func (app *App) drawHelpPopup() {
@@ -1431,6 +1634,23 @@ func (app *App) drawMarkdownLine(x, y int, s string, maxWidth int) {
 		app.screen.SetContent(col, y, runes[i], nil, normalStyle)
 		col++
 		i++
+	}
+}
+
+func (app *App) drawMarkdownLineWithSelection(x, y int, s string, maxWidth int) {
+	// First draw the markdown-styled line
+	app.drawMarkdownLine(x, y, s, maxWidth)
+
+	// Then overlay selection highlighting if selecting in SRE pane
+	if app.selecting && app.selPane == "sre" {
+		selStyle := tcell.StyleDefault.Background(tcell.ColorBlue).Foreground(tcell.ColorWhite)
+		for col := x; col < x+maxWidth && col < app.width; col++ {
+			if app.isInSelection(col, y) {
+				// Get current content and apply selection style
+				mainc, combc, _, _ := app.screen.GetContent(col, y)
+				app.screen.SetContent(col, y, mainc, combc, selStyle)
+			}
+		}
 	}
 }
 
@@ -1872,28 +2092,39 @@ func (app *App) setStatus(msg string) {
 
 // Helper functions
 
+func isPromptLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return true
+	}
+	// Common prompt patterns
+	if strings.HasSuffix(line, "❯") ||
+		strings.HasSuffix(line, "$") ||
+		strings.HasSuffix(line, "#") ||
+		strings.HasSuffix(line, "%") ||
+		strings.HasSuffix(line, ">") ||
+		strings.Contains(line, "➜") ||
+		strings.Contains(line, "╱") ||
+		strings.Contains(line, "on  ") || // git branch indicator
+		strings.Contains(line, "with ") { // user indicator
+		return true
+	}
+	return false
+}
+
 func stripTrailingPrompt(s string) string {
 	lines := strings.Split(s, "\n")
-	// Remove trailing lines that look like shell prompts
-	for len(lines) > 0 {
-		last := strings.TrimSpace(lines[len(lines)-1])
-		if last == "" {
-			lines = lines[:len(lines)-1]
-			continue
-		}
-		// Common prompt endings
-		if strings.HasSuffix(last, "❯") ||
-			strings.HasSuffix(last, "$") ||
-			strings.HasSuffix(last, "#") ||
-			strings.HasSuffix(last, "%") ||
-			strings.HasSuffix(last, ">") ||
-			strings.Contains(last, "➜") ||
-			strings.Contains(last, "╱") {
-			lines = lines[:len(lines)-1]
-			continue
-		}
-		break
+
+	// Remove trailing prompt lines
+	for len(lines) > 0 && isPromptLine(lines[len(lines)-1]) {
+		lines = lines[:len(lines)-1]
 	}
+
+	// Remove leading prompt lines (echo of prompt before command)
+	for len(lines) > 0 && isPromptLine(lines[0]) {
+		lines = lines[1:]
+	}
+
 	return strings.Join(lines, "\n")
 }
 
