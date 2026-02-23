@@ -891,16 +891,17 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 			app.outputBuffer.Reset()
 			app.mu.Unlock()
 
-			// Only save note if there was an actual command
+			// Save note if there was an actual command
 			if command != "" {
 				// Strip prompt lines from output
 				output = stripTrailingPrompt(output)
 				output = strings.TrimSpace(output)
-				// Only queue if there's actual output (not just prompts)
+				// Always save command, include output if present
+				note := fmt.Sprintf("$ %s", command)
 				if output != "" {
-					note := fmt.Sprintf("$ %s\n%s", command, output)
-					app.queueNote(note)
+					note = fmt.Sprintf("$ %s\n%s", command, output)
 				}
+				app.queueNote(note)
 			}
 		}(cmd)
 
@@ -2097,16 +2098,12 @@ func isPromptLine(line string) bool {
 	if line == "" {
 		return true
 	}
-	// Common prompt patterns
+	// Only match clear prompt endings
 	if strings.HasSuffix(line, "❯") ||
-		strings.HasSuffix(line, "$") ||
-		strings.HasSuffix(line, "#") ||
-		strings.HasSuffix(line, "%") ||
-		strings.HasSuffix(line, ">") ||
-		strings.Contains(line, "➜") ||
-		strings.Contains(line, "╱") ||
-		strings.Contains(line, "on  ") || // git branch indicator
-		strings.Contains(line, "with ") { // user indicator
+		strings.HasSuffix(line, " $") ||
+		strings.HasSuffix(line, " #") ||
+		strings.HasSuffix(line, " %") ||
+		strings.Contains(line, "➜") {
 		return true
 	}
 	return false
