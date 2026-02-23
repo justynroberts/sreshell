@@ -179,8 +179,8 @@ func (app *App) runIncidentSession() {
 		fmt.Printf("Error initializing screen: %v\n", err)
 		return
 	}
-	// Enable mouse for pane-isolated selection and scrolling
-	screen.EnableMouse()
+	// Mouse disabled - allows native terminal selection/copy
+	// Use keyboard for scrolling (Up/Down, PgUp/PgDn)
 	app.screen = screen
 	app.width, app.height = screen.Size()
 
