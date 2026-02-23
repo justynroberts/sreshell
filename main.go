@@ -650,6 +650,10 @@ func (app *App) run() {
 				Rows: uint16(app.height - 3),
 				Cols: uint16(app.width*6/10 - 1),
 			})
+			// Clear output buffer - resize causes prompt redraw we don't want to capture
+			app.mu.Lock()
+			app.outputBuffer.Reset()
+			app.mu.Unlock()
 			app.draw()
 
 		case *tcell.EventMouse:
@@ -896,11 +900,8 @@ func (app *App) handleShellInput(ev *tcell.EventKey) {
 				// Strip prompt lines from output
 				output = stripTrailingPrompt(output)
 				output = strings.TrimSpace(output)
-				// Always save command, include output if present
-				note := fmt.Sprintf("$ %s", command)
-				if output != "" {
-					note = fmt.Sprintf("$ %s\n%s", command, output)
-				}
+				// Format: command + output
+				note := fmt.Sprintf("$ %s\n%s", command, output)
 				app.queueNote(note)
 			}
 		}(cmd)
